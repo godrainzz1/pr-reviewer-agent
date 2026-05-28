@@ -11,6 +11,7 @@
  */
 
 import type { GitHub } from '@actions/github/lib/utils';
+import type { ReviewComment } from '../agent/reviewer.js';
 
 // ---------------------------------------------------------------------------
 // 类型别名
@@ -189,4 +190,109 @@ export async function fetchTeamRules(
     );
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// createReviewComment — 将审查结果发布为 PR 评论
+// ---------------------------------------------------------------------------
+
+/**
+ * 将 AI 审查的结构化结果格式化为 Markdown 并发布为 PR 评论。
+ *
+ * 这是整个流水线的最后一环（闭环动作），将 JSON 结果转换为人类可读的
+ * 评论直接展示在 PR 的 Conversation 标签页中。
+ *
+ * 当审查意见为空时，发布一条正向反馈评论（告知团队未发现问题），
+ * 避免审查静默通过造成的困惑。
+ *
+ * @param octokit  - 已认证的 GitHub Octokit 实例
+ * @param owner    - 仓库所有者
+ * @param repo     - 仓库名称
+ * @param prNumber - Pull Request 编号
+ * @param comments - 通过校验的审查意见列表
+ */
+export async function createReviewComment(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  comments: ReviewComment[],
+): Promise<void> {
+  const body = formatReviewBody(comments);
+
+  try {
+    console.log(
+      `[createReviewComment] 正在发布审查评论到 PR #${prNumber}...`,
+    );
+
+    await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body,
+    });
+
+    console.log(
+      `[createReviewComment] ✅ 审查评论已成功发布（${comments.length} 条意见）`,
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+    console.error(
+      `[createReviewComment] ❌ 发布评论失败: ${message}`,
+    );
+    throw error;
+  }
+}
+
+/**
+ * 将审查意见列表格式化为 Markdown 文本。
+ *
+ * 输出格式：
+ * - 标题行（含机器人标识）
+ * - 意见条数统计
+ * - 每条意见：文件路径 + 行号 + 问题描述 + 修复建议
+ * - 当无意见时输出正向反馈
+ */
+function formatReviewBody(comments: ReviewComment[]): string {
+  const header = [
+    '## 🤖 PR Review Agent — AI 代码审查报告',
+    '',
+  ];
+
+  if (comments.length === 0) {
+    return [
+      ...header,
+      '✅ **审查完成，未发现需要关注的问题。**',
+      '',
+      '系统已对本次 PR 的 diff 进行了安全检查、逻辑审查和代码质量评估，',
+      '未检测到安全漏洞、逻辑错误或明显的代码质量问题。',
+      '',
+      '> 本评论由 PR Reviewer Agent 自动生成，基于 DeepSeek V4 模型分析。',
+    ].join('\n');
+  }
+
+  const summary = [
+    `本次审查共发现 **${comments.length}** 条意见，请逐条确认并修改：`,
+    '',
+    '---',
+    '',
+  ];
+
+  const items = comments.map((c, i) => {
+    return [
+      `### ${i + 1}. \`${c.file}\` — 第 ${c.line} 行`,
+      '',
+      c.comment,
+      '',
+      '---',
+      '',
+    ].join('\n');
+  });
+
+  const footer = [
+    '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略或在 `.github/REVIEW_RULES.md` 中调整审查规则。',
+  ];
+
+  return [...header, ...summary, ...items, ...footer].join('\n');
 }

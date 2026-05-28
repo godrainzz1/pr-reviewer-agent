@@ -1,0 +1,23 @@
+name: 'PR Reviewer Agent'
+description: 'AI-powered code review that analyzes PR diffs and posts review comments'
+author: 'Rain'
+
+inputs:
+  github-token:
+    description: 'GitHub token with repo read/write permissions'
+    required: true
+  openai-key:
+    description: 'API key for the LLM service (DeepSeek or any OpenAI-compatible provider)'
+    required: true
+  openai-base-url:
+    description: 'Base URL for the OpenAI-compatible API endpoint'
+    required: false
+    default: 'https://api.deepseek.com'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
