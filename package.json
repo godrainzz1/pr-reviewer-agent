@@ -1,0 +1,13 @@
+{
+  "name": "pr-reviewer-agent",
+  "version": "1.0.0",
+  "description": "GitHub Action that reviews PR diffs using LLM and posts review comments",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "license": "MIT"
+}
