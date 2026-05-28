@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run AI Reviewer Agent
-        uses: ./ # 这句话极其霸气，意思是“使用当前仓库根目录下的 Action”
+        uses: ./ # “使用当前仓库根目录下的 Action”
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }} # GitHub 自带的权限令牌
           openai-key: ${{ secrets.OPENAI_API_KEY }}
