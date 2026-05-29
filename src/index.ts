@@ -72,7 +72,7 @@ async function run(): Promise<void> {
     }
 
     // ─── 6. 将审查结果发布为行级 PR Review（闭环的最后一步）───
-    await createPRReview(octokit, owner, repo, prNumber, result.comments, commitId);
+    await createPRReview(octokit, owner, repo, prNumber, result.comments, commitId, result.usage);
 
     console.log('[index] ✅ 审查流水线全部完成');
   } catch (error) {

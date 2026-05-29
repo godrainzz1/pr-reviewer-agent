@@ -36478,14 +36478,16 @@ async function fetchTeamRules(octokit, owner, repo) {
         return null;
     }
 }
-// ---------------------------------------------------------------------------
-// createPRReview — 将审查结果发布为行级 PR Review
-// ---------------------------------------------------------------------------
+function formatUsageFooter(usage) {
+    if (!usage)
+        return '';
+    return `\n> 📊 Token 消耗 — prompt: ${usage.promptTokens} | completion: ${usage.completionTokens} | total: ${usage.totalTokens}`;
+}
 /**
  * 构建 Review body（Markdown 格式）。
- * 包含 Bot 标记、意见摘要和通用评论。
+ * 包含 Bot 标记、意见摘要、Token 用量和通用评论。
  */
-function buildReviewBody(generalComments, totalInline) {
+function buildReviewBody(generalComments, totalInline, usage) {
     const header = [
         `${BOT_MARKER}`,
         '## 🤖 PR Review Agent — AI 代码审查报告',
@@ -36501,13 +36503,13 @@ function buildReviewBody(generalComments, totalInline) {
             '未检测到安全漏洞、逻辑错误或明显的代码质量问题。',
             '',
             '> 本评论由 PR Reviewer Agent 自动生成，基于 DeepSeek V4 模型分析。',
+            formatUsageFooter(usage),
         ].join('\n');
     }
     const summary = [
         `本次审查共发现 **${total}** 条意见（${totalInline} 条行级 + ${generalComments.length} 条通用），请逐条确认并修改：`,
         '',
     ];
-    // 通用评论（无行号的）
     let generalSection = '';
     if (generalComments.length > 0) {
         generalSection = [
@@ -36529,6 +36531,7 @@ function buildReviewBody(generalComments, totalInline) {
     }
     const footer = [
         '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略或在 `.github/REVIEW_RULES.md` 中调整审查规则。',
+        formatUsageFooter(usage),
     ];
     return [...header, ...summary, generalSection, ...footer].join('\n');
 }
@@ -36582,11 +36585,11 @@ async function findPreviousBotReview(octokit, owner, repo, prNumber) {
  * @param comments - 通过校验的审查意见列表（含 position）
  * @param commitId - 当前 PR head commit SHA（用于绑定 review 到特定 commit）
  */
-async function createPRReview(octokit, owner, repo, prNumber, comments, commitId) {
+async function createPRReview(octokit, owner, repo, prNumber, comments, commitId, usage) {
     // 分离 inline 和 general 评论
     const inlineComments = comments.filter((c) => c.position != null);
     const generalComments = comments.filter((c) => c.position == null);
-    const body = buildReviewBody(generalComments, inlineComments.length);
+    const body = buildReviewBody(generalComments, inlineComments.length, usage);
     // 构建 GitHub API 所需的 inline comment 格式
     const reviewComments = inlineComments.map((c) => ({
         path: c.file,
@@ -36615,7 +36618,7 @@ async function createPRReview(octokit, owner, repo, prNumber, comments, commitId
         console.error(`[createPRReview] ❌ PR Review 发布失败: ${errMsg}`);
         console.log('[createPRReview] ⏬ 降级为通用 Issue Comment...');
         // 将所有意见合并到 body 中（不再区分 inline/general）
-        const fallbackBody = buildFallbackBody(comments);
+        const fallbackBody = buildFallbackBody(comments, usage);
         await withRetry(async () => {
             await octokit.rest.issues.createComment({
                 owner,
@@ -36630,7 +36633,7 @@ async function createPRReview(octokit, owner, repo, prNumber, comments, commitId
 /**
  * 构建降级评论 body：将全部意见转为通用 Markdown 评论。
  */
-function buildFallbackBody(comments) {
+function buildFallbackBody(comments, usage) {
     const header = [
         `${BOT_MARKER}`,
         '## 🤖 PR Review Agent — AI 代码审查报告',
@@ -36644,6 +36647,7 @@ function buildFallbackBody(comments) {
             '✅ **审查完成，未发现需要关注的问题。**',
             '',
             '> 本评论由 PR Reviewer Agent 自动生成。',
+            formatUsageFooter(usage),
         ].join('\n');
     }
     const items = comments.map((c, i) => {
@@ -36658,6 +36662,7 @@ function buildFallbackBody(comments) {
     });
     const footer = [
         '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略。',
+        formatUsageFooter(usage),
     ];
     return [...header, `本次审查共发现 **${comments.length}** 条意见：`, '', ...items, ...footer].join('\n');
 }
@@ -48624,7 +48629,7 @@ async function run() {
             });
         }
         // ─── 6. 将审查结果发布为行级 PR Review（闭环的最后一步）───
-        await createPRReview(octokit, owner, repo, prNumber, result.comments, commitId);
+        await createPRReview(octokit, owner, repo, prNumber, result.comments, commitId, result.usage);
         console.log('[index] ✅ 审查流水线全部完成');
     }
     catch (error) {

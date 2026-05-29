@@ -17,6 +17,11 @@ import type { ReviewComment } from '../agent/reviewer.js';
 type Octokit = InstanceType<typeof GitHub>;
 export declare function fetchPRDiff(octokit: Octokit, owner: string, repo: string, prNumber: number): Promise<string>;
 export declare function fetchTeamRules(octokit: Octokit, owner: string, repo: string): Promise<string | null>;
+type UsageInfo = {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+};
 /**
  * 将审查结果发布为 PR Review（使用 pulls.createReview 支持行级 inline comment）。
  *
@@ -33,5 +38,5 @@ export declare function fetchTeamRules(octokit: Octokit, owner: string, repo: st
  * @param comments - 通过校验的审查意见列表（含 position）
  * @param commitId - 当前 PR head commit SHA（用于绑定 review 到特定 commit）
  */
-export declare function createPRReview(octokit: Octokit, owner: string, repo: string, prNumber: number, comments: ReviewComment[], commitId?: string): Promise<void>;
+export declare function createPRReview(octokit: Octokit, owner: string, repo: string, prNumber: number, comments: ReviewComment[], commitId?: string, usage?: UsageInfo): Promise<void>;
 export {};

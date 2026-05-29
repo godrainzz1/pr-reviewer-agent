@@ -27,3 +27,4 @@ jobs:
           name: token-usage-pr-${{ github.event.pull_request.number }}
           path: token-usage.jsonl
           retention-days: 30
+          if-no-files-found: warn
