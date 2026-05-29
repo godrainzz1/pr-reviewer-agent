@@ -12,4 +12,4 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }} # GitHub 自带的权限令牌
           openai-key: ${{ secrets.OPENAI_API_KEY }}
-          openai-base-url: "https://api.deepseek.com/v1" # 指向 DeepSeek
+          openai-base-url: "https://api.deepseek.com"
