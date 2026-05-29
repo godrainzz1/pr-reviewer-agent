@@ -81,3 +81,10 @@ def calculate_total(items):
     return total
     tax = total * 0.15
     return total + tax
+
+
+def search_users(keyword):
+    conn = sqlite3.connect("users.db")
+    return conn.execute(
+        "SELECT * FROM users WHERE name LIKE '%" + keyword + "%'"
+    ).fetchall()
