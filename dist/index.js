@@ -36593,21 +36593,73 @@ async function createPRReview(octokit, owner, repo, prNumber, comments, commitId
         position: c.position,
         body: c.comment,
     }));
-    await withRetry(async () => {
-        // ── 去重：查找并 dismiss 旧的 Bot pending Review ──
-        await findPreviousBotReview(octokit, owner, repo, prNumber);
-        console.log(`[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`);
-        await octokit.rest.pulls.createReview({
-            owner,
-            repo,
-            pull_number: prNumber,
-            commit_id: commitId,
-            body,
-            event: 'COMMENT',
-            comments: reviewComments,
-        });
-        console.log(`[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`);
-    }, 'createPRReview');
+    try {
+        await withRetry(async () => {
+            await findPreviousBotReview(octokit, owner, repo, prNumber);
+            console.log(`[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`);
+            await octokit.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: prNumber,
+                commit_id: commitId,
+                body,
+                event: 'COMMENT',
+                comments: reviewComments,
+            });
+            console.log(`[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`);
+        }, 'createPRReview');
+    }
+    catch (reviewError) {
+        // ── 降级：inline review 失败时回退到通用 Issue Comment ──
+        const errMsg = reviewError instanceof Error ? reviewError.message : String(reviewError);
+        console.error(`[createPRReview] ❌ PR Review 发布失败: ${errMsg}`);
+        console.log('[createPRReview] ⏬ 降级为通用 Issue Comment...');
+        // 将所有意见合并到 body 中（不再区分 inline/general）
+        const fallbackBody = buildFallbackBody(comments);
+        await withRetry(async () => {
+            await octokit.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: fallbackBody,
+            });
+            console.log('[createPRReview] ✅ 降级评论已成功发布');
+        }, 'createPRReview-fallback');
+    }
+}
+/**
+ * 构建降级评论 body：将全部意见转为通用 Markdown 评论。
+ */
+function buildFallbackBody(comments) {
+    const header = [
+        `${BOT_MARKER}`,
+        '## 🤖 PR Review Agent — AI 代码审查报告',
+        '',
+        '> ⚠️ 行级 Review 发布失败，已降级为通用评论。',
+        '',
+    ];
+    if (comments.length === 0) {
+        return [
+            ...header,
+            '✅ **审查完成，未发现需要关注的问题。**',
+            '',
+            '> 本评论由 PR Reviewer Agent 自动生成。',
+        ].join('\n');
+    }
+    const items = comments.map((c, i) => {
+        return [
+            `### ${i + 1}. \`${c.file}\` — 第 ${c.line} 行`,
+            '',
+            c.comment,
+            '',
+            '---',
+            '',
+        ].join('\n');
+    });
+    const footer = [
+        '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略。',
+    ];
+    return [...header, `本次审查共发现 **${comments.length}** 条意见：`, '', ...items, ...footer].join('\n');
 }
 
 ;// CONCATENATED MODULE: ./node_modules/openai/internal/tslib.mjs
@@ -47992,7 +48044,7 @@ function logTokenUsage(entry) {
  * 4. 过滤无需审查的配置文件
  */
 // ---------------------------------------------------------------------------
-// 常量：不带审查的文件模式
+// 常量
 // ---------------------------------------------------------------------------
 const SKIP_PATTERNS = [
     /\.json$/i,
@@ -48006,31 +48058,25 @@ const SKIP_PATTERNS = [
 function shouldSkipFile(filePath) {
     return SKIP_PATTERNS.some((p) => p.test(filePath));
 }
+// 下一个 hunk header 或文件开始标记
+const NEXT_SECTION_RE = /^@@|^diff --git|^$/;
 // ---------------------------------------------------------------------------
 // 公开 API
 // ---------------------------------------------------------------------------
-/**
- * 解析 unified diff 文本，提取所有文件的 hunk 信息。
- *
- * 仅处理代码文件（排除 .json / .lock / .yml / .yaml / .md / dist / .github）。
- *
- * @param rawDiff - 原始 unified diff 文本
- * @returns 结构化的 diff 解析结果
- */
 function parseDiff(rawDiff) {
     const files = new Map();
     const lines = rawDiff.split('\n');
     let currentFile = null;
-    let diffPosition = 0;
-    for (const line of lines) {
-        diffPosition++;
-        // ── 文件头行：提取新增侧文件路径 ──
+    let i = 0;
+    while (i < lines.length) {
+        const line = lines[i];
+        // ── 文件头行 ──
         const newFileMatch = line.match(/^\+\+\+ b\/(.+)$/);
         if (newFileMatch) {
             const filePath = newFileMatch[1];
-            // 跳过不需要审查的文件
             if (shouldSkipFile(filePath)) {
                 currentFile = null;
+                i++;
                 continue;
             }
             currentFile = {
@@ -48041,10 +48087,13 @@ function parseDiff(rawDiff) {
                 lineToPosition: new Map(),
             };
             files.set(filePath, currentFile);
+            i++;
             continue;
         }
-        if (!currentFile)
+        if (!currentFile) {
+            i++;
             continue;
+        }
         // ── hunk header ──
         const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
         if (hunkMatch) {
@@ -48058,17 +48107,17 @@ function parseDiff(rawDiff) {
             };
             currentFile.hunks.push(hunk);
             let physicalLine = newStart;
-            // 遍历 hunk 内的行
-            for (const hunkLine of lines.slice(diffPosition)) {
-                diffPosition++;
-                if (hunkLine.startsWith('@@') && !hunkLine.startsWith(line)) {
-                    // 下一个 hunk 开始了，回退 diffPosition
-                    diffPosition--;
+            i++; // 移到 hunk 内容第一行
+            // 消费 hunk 内容行（while 循环避免重复处理）
+            while (i < lines.length) {
+                const hunkLine = lines[i];
+                // 遇到下一个 section 则停止
+                if (NEXT_SECTION_RE.test(hunkLine) && !hunkLine.startsWith('+') && !hunkLine.startsWith('-') && hunkLine !== ' ' && hunkLine !== '') {
                     break;
                 }
-                // 跳过空行（diff 末尾）
+                // 空行：可能是 diff 末尾
                 if (hunkLine === '') {
-                    // 如果是文件末尾的空行，可能是下一个文件分隔符
+                    i++;
                     continue;
                 }
                 const kind = hunkLine.startsWith('+')
@@ -48078,7 +48127,7 @@ function parseDiff(rawDiff) {
                         : ' ';
                 const hl = {
                     content: hunkLine.slice(1),
-                    diffPosition,
+                    diffPosition: i + 1,
                     physicalLine: kind !== '-' ? physicalLine : -(physicalLine - 1),
                     kind,
                 };
@@ -48087,19 +48136,14 @@ function parseDiff(rawDiff) {
                 if (kind === '+') {
                     currentFile.addedLines.add(physicalLine);
                 }
-                currentFile.lineToPosition.set(physicalLine, diffPosition);
+                currentFile.lineToPosition.set(physicalLine, i + 1);
                 if (kind !== '-')
                     physicalLine++;
-                // 检测下一个 hunk header 或文件头或 EOF
-                // (在下一次循环时处理)
+                i++;
             }
-            // 由于内层循环已经消费了 hunk 内容，需要调整 diffPosition
-            // 使得外层循环能正确继续
-            diffPosition--;
-            continue;
+            continue; // 重回外层 while，不额外 i++
         }
-        // 非文件头、非 hunk header 的行被跳过
-        // 更新 diffPosition tracking
+        i++;
     }
     console.log(`[parseDiff] ✅ 解析完成: ${files.size} 个代码文件需要审查`);
     for (const [path, file] of files) {
@@ -48107,28 +48151,12 @@ function parseDiff(rawDiff) {
     }
     return { files };
 }
-/**
- * 将 LLM 输出的物理行号映射为 GitHub API 所需的 diff position。
- *
- * @param parsedDiff - diff 解析结果
- * @param filePath   - 文件路径
- * @param physicalLine - 物理行号（数字字符串）
- * @returns diff position（1-based），找不到映射则返回 null
- */
 function mapLineToPosition(parsedDiff, filePath, physicalLine) {
     const file = parsedDiff.files.get(filePath);
     if (!file)
         return null;
     return file.lineToPosition.get(physicalLine) ?? null;
 }
-/**
- * 校验 LLM 输出的文件+行号是否在真实 diff 中存在。
- *
- * @returns 校验结果：
- *   - 'valid'  → 文件存在且行号是实际新增/修改的行
- *   - 'file_only' → 文件存在但行号不是新增行（可降级为 General Comment）
- *   - 'invalid' → 文件不存在于 diff 中（应丢弃）
- */
 function validateLocation(parsedDiff, filePath, line) {
     const file = parsedDiff.files.get(filePath);
     if (!file)
@@ -48138,7 +48166,6 @@ function validateLocation(parsedDiff, filePath, line) {
         return 'file_only';
     if (file.addedLines.has(lineNum))
         return 'valid';
-    // 检查是否在 hunk 范围内（上下文行/删除行）
     const inHunk = file.hunks.some((h) => {
         return lineNum >= h.newStart && lineNum < h.newStart + h.newCount;
     });

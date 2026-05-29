@@ -389,26 +389,88 @@ export async function createPRReview(
     body: c.comment,
   }));
 
-  await withRetry(async () => {
-    // ── 去重：查找并 dismiss 旧的 Bot pending Review ──
-    await findPreviousBotReview(octokit, owner, repo, prNumber);
+  try {
+    await withRetry(async () => {
+      await findPreviousBotReview(octokit, owner, repo, prNumber);
 
+      console.log(
+        `[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`,
+      );
+
+      await octokit.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number: prNumber,
+        commit_id: commitId,
+        body,
+        event: 'COMMENT',
+        comments: reviewComments,
+      });
+
+      console.log(
+        `[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`,
+      );
+    }, 'createPRReview');
+  } catch (reviewError) {
+    // ── 降级：inline review 失败时回退到通用 Issue Comment ──
+    const errMsg = reviewError instanceof Error ? reviewError.message : String(reviewError);
+    console.error(
+      `[createPRReview] ❌ PR Review 发布失败: ${errMsg}`,
+    );
     console.log(
-      `[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`,
+      '[createPRReview] ⏬ 降级为通用 Issue Comment...',
     );
 
-    await octokit.rest.pulls.createReview({
-      owner,
-      repo,
-      pull_number: prNumber,
-      commit_id: commitId,
-      body,
-      event: 'COMMENT',
-      comments: reviewComments,
-    });
+    // 将所有意见合并到 body 中（不再区分 inline/general）
+    const fallbackBody = buildFallbackBody(comments);
 
-    console.log(
-      `[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`,
-    );
-  }, 'createPRReview');
+    await withRetry(async () => {
+      await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: prNumber,
+        body: fallbackBody,
+      });
+      console.log('[createPRReview] ✅ 降级评论已成功发布');
+    }, 'createPRReview-fallback');
+  }
+}
+
+/**
+ * 构建降级评论 body：将全部意见转为通用 Markdown 评论。
+ */
+function buildFallbackBody(comments: ReviewComment[]): string {
+  const header = [
+    `${BOT_MARKER}`,
+    '## 🤖 PR Review Agent — AI 代码审查报告',
+    '',
+    '> ⚠️ 行级 Review 发布失败，已降级为通用评论。',
+    '',
+  ];
+
+  if (comments.length === 0) {
+    return [
+      ...header,
+      '✅ **审查完成，未发现需要关注的问题。**',
+      '',
+      '> 本评论由 PR Reviewer Agent 自动生成。',
+    ].join('\n');
+  }
+
+  const items = comments.map((c, i) => {
+    return [
+      `### ${i + 1}. \`${c.file}\` — 第 ${c.line} 行`,
+      '',
+      c.comment,
+      '',
+      '---',
+      '',
+    ].join('\n');
+  });
+
+  const footer = [
+    '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略。',
+  ];
+
+  return [...header, `本次审查共发现 **${comments.length}** 条意见：`, '', ...items, ...footer].join('\n');
 }
