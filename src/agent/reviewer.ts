@@ -4,43 +4,36 @@
  *
  * 职责：
  * 1. 构建系统提示词（集成 RAG 注入 + JSON 防幻觉约束）
- * 2. 调用 DeepSeek V4（兼容 OpenAI SDK）执行智能代码审查
- * 3. 对 LLM 输出进行严格的 JSON schema 校验与清洗
+ * 2. 文件感知的 diff 截断与优先级排序
+ * 3. 调用 DeepSeek V4（兼容 OpenAI SDK）执行智能代码审查
+ * 4. 对 LLM 输出进行严格的 JSON schema 校验 + diff 行号真实性验证
  *
- * 核心设计：
- * - RAG（检索增强生成）: 将团队审查规则作为系统提示词扩展注入
- * - JSON 防幻觉策略: Prompt 约束 + 多层级解析 + 字段级校验 + 不合规过滤
+ * Phase 4 增强：
+ * - 文件感知截断：按代码文件优先，排除配置文件，Token 预算控制
+ * - 行号真实性校验：LLM 输出必须存在于 parsedDiff 中
  */
 
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { logTokenUsage } from '../tools/logger.js';
+import type { ParsedDiff } from '../tools/diff-parser.js';
+import { validateLocation, mapLineToPosition } from '../tools/diff-parser.js';
 
 // ---------------------------------------------------------------------------
 // 导出类型定义
 // ---------------------------------------------------------------------------
 
-/**
- * 单条审查意见 —— 严格对应 LLM Prompt 中要求的 JSON 输出结构。
- *
- * 每个字段都是必填的 string 类型，防止模型返回 null / 缺失字段 / 错误类型。
- * - file: 必须从 diff 的 ---/+++ 行中提取真实路径，杜绝杜撰
- * - line: 必须是纯阿拉伯数字字符串（如 "42"），不接受范围或描述
- * - comment: 必须包含可操作的具体建议，不接受笼统评价
- */
+/** 单条审查意见 */
 export interface ReviewComment {
-  /** 触发问题的文件路径（相对于仓库根目录） */
   file: string;
-  /** 问题所在行号，纯数字字符串，如 "42" */
   line: string;
-  /** 具体审查意见与修复建议 */
   comment: string;
+  /** diff position（1-based），null 表示降级为通用评论 */
+  position?: number;
 }
 
-/** analyzeCode 函数的聚合返回结果 */
 export interface AnalysisResult {
-  /** 有效的审查意见列表（已通过 schema 校验） */
   comments: ReviewComment[];
-  /** 模型返回的 Token 实际用量（来自 API response 的 usage 字段） */
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -52,47 +45,26 @@ export interface AnalysisResult {
 // 常量配置
 // ---------------------------------------------------------------------------
 
-/** DeepSeek API 端点（兼容 OpenAI SDK 的 baseURL 覆盖机制） */
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
-
-/** 默认使用 DeepSeek Chat 模型（V4 系列） */
 const DEFAULT_MODEL = 'deepseek-chat';
 
-/** Diff 内容的最大字符数，超出部分将被截断以控制 Token 消耗 */
-const MAX_DIFF_LENGTH = 50_000;
+/** 最大 Token 预算（prompt 部分），DeepSeek V4 128K context，留 28K 给输出 */
+const MAX_PROMPT_TOKENS = 90_000;
 
-/** API 调用最大重试次数（不含首次调用） */
+/** API 调用最大重试次数 */
 const MAX_RETRIES = 2;
+
+/** 审查优先级：先审查源码文件 */
+const PRIORITY_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
 
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
 
-/**
- * 根据文本字符数粗略预估 Token 数量。
- *
- * 估算依据：
- * - 纯英文场景: 1 token ≈ 4 字符 → 系数 0.25
- * - 代码/中英混合场景: 1 token ≈ 2-3 字符 → 系数 0.3-0.5
- * - 这里取偏保守的 0.4，避免对中文/Unicode 场景过度乐观
- *
- * @param text - 待估算的文本
- * @returns 预估的 Token 数量（向上取整）
- */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length * 0.4);
 }
 
-/**
- * 判断 LLM 调用错误是否值得重试。
- *
- * 可重试的错误类型（瞬时故障）：
- * - 网络层: 超时、连接拒绝、连接重置、网络不可达
- * - 服务端: HTTP 5xx、429 速率限制
- *
- * @param error - 捕获的错误对象
- * @returns 如果可以重试返回 true
- */
 function isRetryableError(error: Error): boolean {
   const msg = error.message.toLowerCase();
   return (
@@ -109,75 +81,15 @@ function isRetryableError(error: Error): boolean {
   );
 }
 
-/** 异步等待指定毫秒数（用于失败重试的递增延迟） */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
-// Prompt 构建 —— 系统提示词（核心：RAG 注入 + JSON 防幻觉约束）
+// Prompt 构建
 // ---------------------------------------------------------------------------
 
-/**
- * 构建发送给 LLM 的系统级提示词。
- *
- * ══════════════════════════════════════════════════════════════════════
- * 【RAG 注入过程详解】
- * ══════════════════════════════════════════════════════════════════════
- *
- * 本函数实现了轻量级 RAG（检索增强生成）的核心「增强」环节：
- *
- *   调用方流程:
- *     1. fetchTeamRules() 从目标仓库拉取 .github/REVIEW_RULES.md
- *     2. 将获取的规则文本传入本函数
- *     3. 本函数将规则作为「团队自定义规范」小节注入系统提示词
- *     4. LLM 同时参考通用最佳实践 + 团队规范生成审查意见
- *
- *   RAG 注入位置: 系统提示词末尾的独立小节
- *   RAG 格式: Markdown 原文直接嵌入（无需 chunk/embedding/向量检索）
- *
- * 这种方案的优势：
- *   - 零基础设施依赖（无需向量数据库或 embedding 服务）
- *   - 团队可以通过修改 REVIEW_RULES.md 实时调整审查偏好
- *   - 失败降级优雅（规则不存在时仍可使用通用规则审查）
- *
- * ══════════════════════════════════════════════════════════════════════
- * 【JSON 防幻觉策略详解】
- * ══════════════════════════════════════════════════════════════════════
- *
- * LLM 在生成结构化输出时容易出现以下「幻觉」问题：
- *   1. 输出 JSON 外还附带解释性文字（"以下是审查结果：[...]"）
- *   2. 用 Markdown 代码块包裹 JSON（```json ... ```）
- *   3. 杜撰不存在的文件路径
- *   4. 行号使用范围（"42-45"）或描述（"顶部附近"）
- *   5. comment 字段为模糊的赞美（"看起来不错"）
- *
- * 本 Prompt 中的对抗措施（分层防御）：
- *
- *   【第一层 - Prompt 约束】
- *   - 明确要求「仅返回 JSON 数组，不得包含任何其他文字」
- *   - 明确禁止 Markdown 代码块标记
- *   - 强制 file / line / comment 三个字段的语义约束
- *   - 要求 line 必须是纯数字字符串
- *
- *   【第二层 - 输出解析】（见 analyzeCode 函数）
- *   - 正则剥离可能的 Markdown 代码块包裹
- *   - JSON.parse 严格解析
- *   - 数组类型校验
- *
- *   【第三层 - 字段级校验】（见 analyzeCode 函数末尾）
- *   - 逐条检查 file 是否为非空 string
- *   - line 必须通过 /^\d+$/ 正则（纯数字）
- *   - comment 必须为非空 string
- *   - 不合规条目直接丢弃并记录告警日志
- *
- * ══════════════════════════════════════════════════════════════════════
- *
- * @param rules - 团队审查规则文本（从 fetchTeamRules 获取），可为 null
- * @returns 完整的系统提示词字符串
- */
 function buildSystemPrompt(rules: string | null): string {
-  // ─── 第一部分: 通用审查规范（所有审查的基线标准）───
   const basePrompt = `你是一名资深 TypeScript / Node.js 代码审查专家，拥有十年以上的大型项目实战经验。
 
 你的任务是对 GitHub Pull Request 的 unified diff 进行深度审查，输出结构化的审查意见。
@@ -227,10 +139,6 @@ function buildSystemPrompt(rules: string | null): string {
    - 推荐的修复方案（优先给出代码片段）
 4. 如果经过仔细审查后认为代码质量良好、无实质性问题，返回空数组 []。`;
 
-  // ─── 第二部分: RAG 注入 —— 将团队规范追加到系统提示词末尾 ───
-  // 这是轻量级 RAG 的核心步骤：
-  // 从外部知识源（.github/REVIEW_RULES.md）检索到的规则作为上下文扩展
-  // 注入到 Prompt 中，让模型在审查时同时遵守通用规范和团队约定。
   if (rules) {
     const ragSection = [
       '',
@@ -257,36 +165,101 @@ function buildSystemPrompt(rules: string | null): string {
 }
 
 /**
- * 构建用户级提示词 —— 携带待审查的 diff 内容。
+ * 构建文件感知的用户提示词。
  *
- * 如果 diff 超过预设最大长度（MAX_DIFF_LENGTH），对内容进行截断处理：
- * - 保留前半部分（通常包含最重要的核心变更）
- * - 追加截断提示，引导模型优先关注前半部分
+ * 从 parsedDiff 提取代码文件，按优先级排列，在 Token 预算内构造 Prompt。
  *
- * @param diff - PR 的 unified diff 文本
+ * @param rawDiff    - 原始 unified diff 文本
+ * @param parsedDiff - diff 解析结果
  * @returns 用户提示词字符串
  */
-function buildUserPrompt(diff: string): string {
-  const truncated = diff.length > MAX_DIFF_LENGTH;
+function buildUserPrompt(rawDiff: string, parsedDiff: ParsedDiff): string {
+  const fileSections = splitDiffByFile(rawDiff);
 
-  if (truncated) {
-    console.warn(
-      `[buildUserPrompt] ⚠️  diff 长度 (${diff.length} 字符) 超过 ${MAX_DIFF_LENGTH} 限制，将被截断处理`,
-    );
+  // 分离优先级文件和普通文件
+  const priority: string[] = [];
+  const normal: string[] = [];
+
+  for (const [path, content] of fileSections) {
+    if (!parsedDiff.files.has(path)) continue; // 跳过被过滤的文件
+    const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
+    if (PRIORITY_EXTENSIONS.includes(ext)) {
+      priority.push(content);
+    } else {
+      normal.push(content);
+    }
   }
 
-  const diffContent = truncated
-    ? diff.slice(0, MAX_DIFF_LENGTH) +
-      '\n\n[... diff 已被截断，请优先审查前半部分的逻辑变更和安全问题 ...]'
-    : diff;
+  const orderedSections = [...priority, ...normal];
+  const totalFiles = orderedSections.length;
 
-  return [
-    '以下是本次 Pull Request 的代码变更（unified diff 格式）：',
-    '',
-    diffContent,
-    '',
-    '请严格按照系统提示词中的 JSON 数组格式返回你的审查结果。',
-  ].join('\n');
+  if (totalFiles === 0) {
+    console.warn('[buildUserPrompt] ⚠️  无代码文件需要审查');
+    return '本次 PR 仅包含配置文件变更，无可审查的源代码文件。';
+  }
+
+  // Token 预算控制：从头累积文件，超出则截断
+  const prefix = `以下是本次 PR 的代码变更（共 ${parsedDiff.files.size} 个代码文件，此处展示 ${totalFiles} 个）：\n\n`;
+  let body = prefix;
+  let budget = MAX_PROMPT_TOKENS - estimateTokens(prefix);
+  let included = 0;
+  let truncated = false;
+
+  for (const section of orderedSections) {
+    const sectionTokens = estimateTokens(section);
+    if (budget - sectionTokens < 0) {
+      truncated = true;
+      break;
+    }
+    body += section;
+    budget -= sectionTokens;
+    included++;
+  }
+
+  if (truncated && included < totalFiles) {
+    body += `\n\n[... Token 预算限制，省略 ${totalFiles - included} 个文件。以上 ${included} 个文件为按优先级排列的源码文件 ...]\n`;
+  }
+
+  console.log(
+    `[buildUserPrompt] 📊 文件感知 Prompt: ${included}/${totalFiles} 个文件，预估 ~${estimateTokens(body)} tokens`,
+  );
+
+  return body + '\n请严格按照系统提示词中的 JSON 数组格式返回你的审查结果。';
+}
+
+/**
+ * 将 raw diff 按文件切分为 (filePath, fileSection) 对。
+ */
+function splitDiffByFile(rawDiff: string): Map<string, string> {
+  const sections = new Map<string, string>();
+  const lines = rawDiff.split('\n');
+
+  let currentPath: string | null = null;
+  let currentLines: string[] = [];
+
+  for (const line of lines) {
+    // 检测文件头：diff --git a/... b/...
+    const fileMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (fileMatch) {
+      if (currentPath && currentLines.length > 0) {
+        sections.set(currentPath, currentLines.join('\n'));
+      }
+      currentPath = fileMatch[2];
+      currentLines = [line];
+      continue;
+    }
+
+    if (currentPath) {
+      currentLines.push(line);
+    }
+  }
+
+  // 最后一个文件
+  if (currentPath && currentLines.length > 0) {
+    sections.set(currentPath, currentLines.join('\n'));
+  }
+
+  return sections;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,44 +269,27 @@ function buildUserPrompt(diff: string): string {
 /**
  * 对 LLM 返回的原始文本进行清洗、解析和字段级校验。
  *
- * ── 分层防御流程 ──
- *
- *   原始文本 (LLM 返回)
- *     │
- *     ▼
- *   【第二层】清洗 & JSON 解析
- *     ├── 剥离可能的 Markdown 代码块标记（```json ... ```）
- *     ├── 尝试 JSON.parse
- *     ├── 若失败 → 正则提取 JSON 数组片段再试
- *     └── 仍然失败 → 抛出异常
- *     │
- *     ▼
- *   【第三层】字段级逐条校验
- *     ├── 必须是数组
- *     ├── 每项必须是 object
- *     ├── file: 非空 string
- *     ├── line: string 且通过 /^\d+$/ 正则
- *     ├── comment: 非空 string
- *     └── 不合规条目 → 丢弃 + console.warn
- *     │
- *     ▼
- *   返回干净的 ReviewComment[]
+ * Phase 4 新增：对验证通过的条目，通过 parsedDiff 验证 file + line 的真实性。
+ * - 'valid' → 保留并附带 diff position（用于 inline comment）
+ * - 'file_only' → 保留但 position=null（降级为 review body 通用评论）
+ * - 'invalid' → 丢弃
  *
  * @param rawContent - LLM 的原始响应文本
- * @returns 通过全部校验的审查意见数组
- * @throws 当无法从响应中提取有效 JSON 数组时
+ * @param parsedDiff - diff 解析结果，用于行号真实性校验
+ * @returns 通过校验的审查意见数组
  */
-function parseAndValidateResponse(rawContent: string): ReviewComment[] {
+function parseAndValidateResponse(
+  rawContent: string,
+  parsedDiff: ParsedDiff,
+): ReviewComment[] {
   let jsonStr = rawContent;
 
   // ─── 第二层 Step 1: 剥离 Markdown 代码块标记 ───
-  // 即使 Prompt 明确禁止使用 ```json```，部分模型仍可能添加。
-  // 使用正则提取代码块内的内容，作为第一道清洗。
   const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (codeBlockMatch) {
     jsonStr = codeBlockMatch[1].trim();
     console.log(
-      '[parseAndValidateResponse] 检测到 Markdown 代码块包裹，已自动剥离（模型未完全遵守格式约束）',
+      '[parseAndValidateResponse] 检测到 Markdown 代码块包裹，已自动剥离',
     );
   }
 
@@ -342,7 +298,6 @@ function parseAndValidateResponse(rawContent: string): ReviewComment[] {
   try {
     parsed = JSON.parse(jsonStr);
   } catch (firstError) {
-    // 直接解析失败时，尝试从文本中提取 JSON 数组片段（容错处理）
     console.warn(
       `[parseAndValidateResponse] 首次 JSON.parse 失败: ${firstError instanceof Error ? firstError.message : String(firstError)}`,
     );
@@ -368,23 +323,22 @@ function parseAndValidateResponse(rawContent: string): ReviewComment[] {
     }
   }
 
-  // ─── 第二层 Step 3: 根类型校验（必须是数组）───
+  // ─── 第二层 Step 3: 根类型校验 ───
   if (!Array.isArray(parsed)) {
     throw new Error(
-      `LLM 返回的 JSON 根类型不是数组，而是 "${typeof parsed}"。` +
-        `这是明显的幻觉输出，缺乏有效的结构化数据。` +
-        `原始内容: ${rawContent.slice(0, 300)}`,
+      `LLM 返回的 JSON 根类型不是数组。原始内容: ${rawContent.slice(0, 300)}`,
     );
   }
 
-  // ─── 第三层: 逐条字段级校验与过滤 ───
+  // ─── 第三层: 逐条字段级校验 + diff 行号真实性验证 ───
   const validComments: ReviewComment[] = [];
   const skippedItems: string[] = [];
+  let discardedCount = 0;
+  let generalCount = 0;
 
   for (let i = 0; i < parsed.length; i++) {
     const item = parsed[i];
 
-    // 基础类型检查：必须是非 null 对象，排除数组、基本类型
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       skippedItems.push(`[${i}] 类型异常: ${JSON.stringify(item)}`);
       continue;
@@ -395,43 +349,70 @@ function parseAndValidateResponse(rawContent: string): ReviewComment[] {
     const line = record.line;
     const comment = record.comment;
 
-    // ── 字段级严格校验 ──
-    // 每个字段都必须存在、类型正确、内容非空
+    const fileValid = typeof file === 'string' && file.trim().length > 0;
+    const lineValid = typeof line === 'string' && /^\d+$/.test(line);
+    const commentValid = typeof comment === 'string' && comment.trim().length > 0;
 
-    const fileValid =
-      typeof file === 'string' && file.trim().length > 0;
-    const lineValid =
-      typeof line === 'string' &&
-      /^\d+$/.test(line); // 正则: 仅纯阿拉伯数字
-    const commentValid =
-      typeof comment === 'string' && comment.trim().length > 0;
-
-    if (fileValid && lineValid && commentValid) {
-      validComments.push({
-        file: file.trim(),
-        line, // 保留原始数字字符串，不做类型转换
-        comment: comment.trim(),
-      });
-    } else {
-      // 记录具体哪一项不满足要求，方便排查模型行为
+    if (!fileValid || !lineValid || !commentValid) {
       const failures: string[] = [];
       if (!fileValid) failures.push(`file 无效: ${JSON.stringify(file)}`);
       if (!lineValid) failures.push(`line 非纯数字: ${JSON.stringify(line)}`);
       if (!commentValid) failures.push(`comment 无效: ${JSON.stringify(comment)}`);
       skippedItems.push(`[${i}] ${failures.join('; ')}`);
+      continue;
+    }
+
+    const cleanFile = (file as string).trim();
+    const cleanLine = line as string;
+    const cleanComment = (comment as string).trim();
+
+    // ── Phase 4: diff 行号真实性校验 ──
+    const locationStatus = validateLocation(parsedDiff, cleanFile, cleanLine);
+
+    if (locationStatus === 'invalid') {
+      // 文件不存在于 diff 中 → 丢弃
+      skippedItems.push(
+        `[${i}] 文件不存在于 diff: ${cleanFile} (LLM 幻觉)`,
+      );
+      discardedCount++;
+      continue;
+    }
+
+    const position = mapLineToPosition(
+      parsedDiff,
+      cleanFile,
+      parseInt(cleanLine, 10),
+    );
+
+    if (locationStatus === 'file_only') {
+      // 文件存在但行号不是新增行 → 降级为通用评论
+      validComments.push({
+        file: cleanFile,
+        line: cleanLine,
+        comment: cleanComment,
+        // position 为 null/undefined，github.ts 会将其作为 body 评论
+      });
+      generalCount++;
+    } else {
+      // 有效行号 → inline comment
+      validComments.push({
+        file: cleanFile,
+        line: cleanLine,
+        comment: cleanComment,
+        position: position ?? undefined,
+      });
     }
   }
 
-  // 输出字段级过滤的统计信息
   if (skippedItems.length > 0) {
     console.warn(
-      `[parseAndValidateResponse] ⚠️  从 ${parsed.length} 条原始输出中过滤掉 ${skippedItems.length} 条不合规条目:`,
+      `[parseAndValidateResponse] ⚠️  过滤 ${skippedItems.length} 条: ${discardedCount} 丢弃 + ${generalCount} 降级为通用`,
     );
     skippedItems.forEach((s) => console.warn(`  - ${s}`));
   }
 
   console.log(
-    `[parseAndValidateResponse] 🎯 JSON 防幻觉校验完成: ${parsed.length} 条输入 → ${validComments.length} 条通过`,
+    `[parseAndValidateResponse] 🎯 校验完成: ${parsed.length} 条输入 → ${validComments.length} 条通过 (${validComments.filter((c) => c.position).length} inline + ${generalCount} general)`,
   );
 
   return validComments;
@@ -441,73 +422,14 @@ function parseAndValidateResponse(rawContent: string): ReviewComment[] {
 // 核心导出函数: analyzeCode
 // ---------------------------------------------------------------------------
 
-/**
- * 使用大模型对 PR diff 进行智能代码审查。
- *
- * ══════════════════════════════════════════════════════════════════════
- * 完整调用流程（含 RAG 注入和 JSON 防幻觉的全链路）
- * ══════════════════════════════════════════════════════════════════════
- *
- *   输入:
- *     diff ───────────────┐
- *     teamRules ──────────┤
- *     apiKey ─────────────┤
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 1. 参数校验 / Token 预估 / 日志输出     │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 2. buildSystemPrompt(teamRules)        │
- *     │    ├── 通用审查规范                     │
- *     │    └── RAG 注入: 团队规范 → 系统提示词  │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 3. buildUserPrompt(diff)               │
- *     │    └── diff 内容 → 用户提示词           │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 4. OpenAI SDK → DeepSeek V4 API       │
- *     │    ├── temperature=0.1 (低温度抗幻觉)   │
- *     │    ├── max_tokens=4096                 │
- *     │    └── 失败自动重试 (最多 2 次)         │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 5. parseAndValidateResponse()          │
- *     │    ├── 第二层: 清洗 + JSON.parse       │
- *     │    └── 第三层: 逐条字段校验 & 过滤      │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 6. 返回 AnalysisResult { comments,     │
- *     │                         usage }         │
- *     └────────────────────────────────────────┘
- *
- * ══════════════════════════════════════════════════════════════════════
- *
- * @param diff      - 从 fetchPRDiff() 获取的 PR unified diff 文本
- * @param teamRules - 从 fetchTeamRules() 获取的团队审查规则（可为 null）
- * @param apiKey    - DeepSeek API Key（通过环境变量传入，不硬编码）
- * @param model     - 可选模型名，默认 "deepseek-chat"（DeepSeek V4）
- * @returns 结构化审查结果，包含通过校验的审查意见列表和 Token 用量
- * @throws 当 LLM 调用经全部重试后仍失败时
- */
 export async function analyzeCode(
   diff: string,
   teamRules: string | null,
   apiKey: string,
+  parsedDiff: ParsedDiff,
   model: string = DEFAULT_MODEL,
   baseUrl: string = DEEPSEEK_BASE_URL,
 ): Promise<AnalysisResult> {
-  // ─── 1. 前置校验 ───
   if (!diff || diff.trim().length === 0) {
     console.warn('[analyzeCode] diff 为空，跳过 LLM 审查调用');
     return { comments: [] };
@@ -519,42 +441,29 @@ export async function analyzeCode(
     );
   }
 
-  // ─── 2. 构建 Prompt（含 RAG 注入）───
-  const systemPrompt = buildSystemPrompt(teamRules);
-  const userPrompt = buildUserPrompt(diff);
+  if (parsedDiff.files.size === 0) {
+    console.log('[analyzeCode] 无代码文件需要审查（仅包含配置文件变更）');
+    return { comments: [] };
+  }
 
-  // ─── 3. Token 消耗预估 ───
+  const systemPrompt = buildSystemPrompt(teamRules);
+  const userPrompt = buildUserPrompt(diff, parsedDiff);
+
   const estimatedSystem = estimateTokens(systemPrompt);
   const estimatedUser = estimateTokens(userPrompt);
-  const estimatedTotal = estimatedSystem + estimatedUser;
 
-  console.log(
-    `[analyzeCode] 📊 Token 消耗预估:`,
-  );
-  console.log(
-    `  - 系统提示词: ~${estimatedSystem} tokens (${systemPrompt.length} 字符)`,
-  );
-  console.log(
-    `  - 用户提示词: ~${estimatedUser} tokens (${userPrompt.length} 字符)`,
-  );
-  console.log(
-    `  - 预估合计:   ~${estimatedTotal} tokens`,
-  );
+  console.log('[analyzeCode] 📊 Token 消耗预估:');
+  console.log(`  - 系统提示词: ~${estimatedSystem} tokens`);
+  console.log(`  - 用户提示词: ~${estimatedUser} tokens`);
+  console.log(`  - 预估合计:   ~${estimatedSystem + estimatedUser} tokens`);
 
-  // ─── 4. 初始化 OpenAI 客户端（指向 DeepSeek API）───
-  // DeepSeek 的 API 与 OpenAI SDK 完全兼容，只需修改 baseURL 即可。
-  const client = new OpenAI({
-    apiKey,
-    baseURL: baseUrl,
-  });
+  const client = new OpenAI({ apiKey, baseURL: baseUrl });
 
-  // ─── 5. 构建消息 ───
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: userPrompt },
   ];
 
-  // ─── 6. 调用 LLM（带重试逻辑）───
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -566,7 +475,7 @@ export async function analyzeCode(
       const completion = await client.chat.completions.create({
         model,
         messages,
-        temperature: 0.1, // 低温度: 提高输出确定性，减少随机幻觉
+        temperature: 0.1,
         max_tokens: 4096,
       });
 
@@ -579,8 +488,16 @@ export async function analyzeCode(
         `[analyzeCode] 实际 Token 用量 — prompt: ${completion.usage?.prompt_tokens ?? 'N/A'}, completion: ${completion.usage?.completion_tokens ?? 'N/A'}, total: ${completion.usage?.total_tokens ?? 'N/A'}`,
       );
 
-      // ─── 7. JSON 防幻觉校验（第二层 + 第三层防线）───
-      const validComments = parseAndValidateResponse(rawContent);
+      if (completion.usage) {
+        logTokenUsage({
+          model,
+          promptTokens: completion.usage.prompt_tokens,
+          completionTokens: completion.usage.completion_tokens,
+          totalTokens: completion.usage.total_tokens,
+        });
+      }
+
+      const validComments = parseAndValidateResponse(rawContent, parsedDiff);
 
       return {
         comments: validComments,
@@ -593,15 +510,13 @@ export async function analyzeCode(
           : undefined,
       };
     } catch (error) {
-      lastError =
-        error instanceof Error ? error : new Error(String(error));
+      lastError = error instanceof Error ? error : new Error(String(error));
       console.error(
         `[analyzeCode] ❌ 第 ${attempt + 1} 次 API 调用失败: ${lastError.message}`,
       );
 
-      // 判断是否需要重试
       if (attempt < MAX_RETRIES && isRetryableError(lastError)) {
-        const waitMs = (attempt + 1) * 1000; // 递增延迟: 1s, 2s
+        const waitMs = (attempt + 1) * 1000;
         console.log(
           `[analyzeCode] ⏳ 检测到可重试错误，${waitMs}ms 后进行第 ${attempt + 2} 次尝试...`,
         );
@@ -609,12 +524,10 @@ export async function analyzeCode(
         continue;
       }
 
-      // 不可重试的错误直接跳出
       break;
     }
   }
 
-  // ─── 8. 所有重试均失败 ───
   throw new Error(
     `[analyzeCode] LLM 调用在 ${MAX_RETRIES + 1} 次尝试后仍然失败。` +
       `最后错误: ${lastError?.message ?? '未知错误'}`,
