@@ -2,4 +2,3 @@ node_modules/
 *.tsbuildinfo
 .env
 .env.local
-token-usage.jsonl

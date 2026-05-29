@@ -5,12 +5,9 @@
  * 职责：
  * 1. 从 GitHub API 获取 PR 的 unified diff 文本
  * 2. 从目标仓库拉取团队自定义审查规则（轻量级 RAG 知识源）
- * 3. 将审查结果发布为行级 PR Review（inline comments）
  *
- * Phase 4 增强：
- * - 指数退避重试（Exponential Backoff）用于所有 API 调用
- * - 重复评论防护（查找并覆盖旧的 Bot Review）
- * - diff position 映射支持行级 inline comment
+ * 所有网络调用均包含异常兜底处理，并通过 console.log 输出关键状态，
+ * 便于在 GitHub Actions 日志中追踪执行过程。
  */
 
 import type { GitHub } from '@actions/github/lib/utils';
@@ -20,161 +17,101 @@ import type { ReviewComment } from '../agent/reviewer.js';
 // 类型别名
 // ---------------------------------------------------------------------------
 
+/**
+ * 已认证的 Octokit 实例类型。
+ * 调用方通过 @actions/github 的 getOctokit(token) 创建并传入。
+ */
 type Octokit = InstanceType<typeof GitHub>;
-
-// ---------------------------------------------------------------------------
-// 常量
-// ---------------------------------------------------------------------------
-
-/** 最大重试次数（不含首次调用） */
-const MAX_RETRIES = 4;
-
-/** 初始退避延迟（毫秒） */
-const BASE_DELAY_MS = 1000;
-
-/** Bot 标识 HTML 注释，用于查找和识别自家的 Review */
-const BOT_MARKER = '<!-- pr-reviewer-agent-bot -->';
-
-// ---------------------------------------------------------------------------
-// 指数退避重试工具
-// ---------------------------------------------------------------------------
-
-/**
- * 判断错误是否可重试。
- * - 429 Rate Limit → 重试（遵守 Retry-After）
- * - 5xx 服务端错误 → 重试
- * - 网络层错误（timeout, ECONNREFUSED, etc.）→ 重试
- * - 401/403/404 → 不重试（404 在 fetchTeamRules 中特殊处理）
- */
-function isRetryableError(error: unknown): boolean {
-  if (error instanceof Error) {
-    const msg = error.message.toLowerCase();
-    if (
-      msg.includes('timeout') ||
-      msg.includes('econnrefused') ||
-      msg.includes('econnreset') ||
-      msg.includes('enetunreach') ||
-      msg.includes('socket hang up')
-    ) {
-      return true;
-    }
-  }
-
-  if (typeof error === 'object' && error !== null && 'status' in error) {
-    const status = (error as { status: number }).status;
-    if (status === 429) return true;
-    if (status >= 500 && status < 600) return true;
-    return false;
-  }
-
-  return false;
-}
-
-/**
- * 从错误对象中提取 Retry-After 响应头（用于 429 限流）。
- */
-function extractRetryAfter(error: unknown): number | null {
-  if (
-    typeof error === 'object' &&
-    error !== null &&
-    'response' in error
-  ) {
-    const response = (error as { response?: { headers?: Record<string, string> } }).response;
-    if (response?.headers) {
-      const header = response.headers['retry-after'];
-      if (header) {
-        const seconds = parseInt(header, 10);
-        if (!isNaN(seconds)) return seconds * 1000;
-        const date = Date.parse(header);
-        if (!isNaN(date)) return Math.max(0, date - Date.now());
-      }
-    }
-  }
-  return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * 对异步操作执行指数退避重试。
- *
- * 策略：初始延迟 1s → 2s → 4s → 8s（最多 4 次重试）。
- * 429 错误的 Retry-After 头优先于计算延迟。
- *
- * @param fn       - 要执行的异步函数
- * @param label    - 日志标签
- * @param maxRetries - 最大重试次数
- * @returns 函数返回值
- */
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  label: string,
-  maxRetries: number = MAX_RETRIES,
-): Promise<T> {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-
-      if (attempt >= maxRetries || !isRetryableError(error)) {
-        break;
-      }
-
-      // 遵守 429 Retry-After
-      const retryAfter = extractRetryAfter(error);
-      const computedDelay = BASE_DELAY_MS * Math.pow(2, attempt);
-      const delayMs = retryAfter ?? computedDelay;
-
-      console.warn(
-        `[${label}] ⏳ 第 ${attempt + 1} 次调用失败，${delayMs}ms 后重试 (${attempt + 2}/${maxRetries + 1})...`,
-      );
-      await sleep(delayMs);
-    }
-  }
-
-  throw lastError;
-}
 
 // ---------------------------------------------------------------------------
 // fetchPRDiff — 获取 PR 的 diff 文本
 // ---------------------------------------------------------------------------
 
+/**
+ * 获取指定 Pull Request 的完整 unified diff 文本。
+ *
+ * 通过设置 mediaType 为 `diff` 格式，GitHub REST API 会直接返回
+ * 纯文本 diff（而非 JSON 对象），这正是后续 LLM 审查所需的输入格式。
+ *
+ * @param octokit  - 已认证的 GitHub Octokit 实例
+ * @param owner    - 仓库所有者（组织名或用户名）
+ * @param repo     - 仓库名称
+ * @param prNumber - Pull Request 编号
+ * @returns PR 的完整 diff 文本字符串
+ * @throws  当网络异常或 PR 不存在时抛出错误
+ */
 export async function fetchPRDiff(
   octokit: Octokit,
   owner: string,
   repo: string,
   prNumber: number,
 ): Promise<string> {
-  return withRetry(async () => {
-    console.log(`[fetchPRDiff] 正在获取 PR #${prNumber} 的 diff 文本...`);
+  try {
+    console.log(
+      `[fetchPRDiff] 正在获取 PR #${prNumber} 的 diff 文本...`,
+    );
 
+    // GitHub REST API: get a pull request
+    // 通过 mediaType.format = 'diff' 让 API 返回纯文本 diff 而非 JSON
     const response = await octokit.rest.pulls.get({
       owner,
       repo,
       pull_number: prNumber,
-      mediaType: { format: 'diff' },
+      mediaType: {
+        format: 'diff',
+      },
     });
 
+    // 当 mediaType 为 diff 时，response.data 在运行时为 string，
+    // 但 TS 类型推断仍基于默认 JSON schema，因此需要显式断言。
     const diff = response.data as unknown as string;
 
     if (typeof diff !== 'string' || diff.length === 0) {
       throw new Error('GitHub API 返回的 diff 为空或类型异常');
     }
 
-    console.log(`[fetchPRDiff] ✅ 成功获取 diff，长度: ${diff.length} 字符`);
+    console.log(
+      `[fetchPRDiff] ✅ 成功获取 diff，长度: ${diff.length} 字符`,
+    );
     return diff;
-  }, 'fetchPRDiff');
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+    console.error(`[fetchPRDiff] ❌ 获取 PR diff 失败: ${message}`);
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // fetchTeamRules — 轻量级 RAG 知识源加载
 // ---------------------------------------------------------------------------
 
+/**
+ * 尝试从目标仓库读取团队自定义审查规则文件。
+ *
+ * ── 轻量级 RAG 机制说明 ──
+ *
+ * 本项目的 RAG（Retrieval-Augmented Generation）采用最简实现：
+ * 1. 【检索（Retrieval）】: 从目标仓库拉取 `.github/REVIEW_RULES.md`
+ *    作为外部知识文档。该文件由各仓库的团队自行维护，包含项目特定的
+ *    编码约定（如：命名规范、目录结构约定、禁用模式等）。
+ * 2. 【增强（Augmented）】: 将该文件内容作为上下文注入到 LLM 的
+ *    系统提示词中（见 src/agent/reviewer.ts 的 buildSystemPrompt）。
+ * 3. 【生成（Generation）】: LLM 同时参考「通用审查最佳实践」和
+ *    「团队特定规范」生成最终的审查意见。
+ *
+ * 这种方案无需向量数据库或 Embedding，适合单文件、轻量级的场景。
+ *
+ * 异常处理策略：
+ * - 文件不存在（404）→ 返回 null，审查继续，仅使用通用规则
+ * - 其他网络/鉴权错误 → 返回 null，记录日志，不阻断主审查流程
+ * - 只有调用方明确需要 RAG 且获取失败时才抛异常
+ *
+ * @param octokit - 已认证的 GitHub Octokit 实例
+ * @param owner   - 仓库所有者
+ * @param repo    - 仓库名称
+ * @returns 规则文件的 Markdown 文本内容，或 null（表示未找到/获取失败）
+ */
 export async function fetchTeamRules(
   octokit: Octokit,
   owner: string,
@@ -183,49 +120,52 @@ export async function fetchTeamRules(
   const rulesPath = '.github/REVIEW_RULES.md';
 
   try {
-    return await withRetry(async () => {
-      console.log(
-        `[fetchTeamRules] 正在尝试加载团队审查规则 (${rulesPath})...`,
+    console.log(
+      `[fetchTeamRules] 正在尝试加载团队审查规则 (${rulesPath})...`,
+    );
+
+    // 调用 GitHub Content API 读取仓库中的文件内容
+    const response = await octokit.rest.repos.getContent({
+      owner,
+      repo,
+      path: rulesPath,
+    });
+
+    const data = response.data;
+
+    // getContent 对目录返回数组，对文件返回单个对象
+    if (Array.isArray(data)) {
+      console.warn(
+        `[fetchTeamRules] ⚠️  ${rulesPath} 是一个目录而非文件，跳过 RAG 加载`,
       );
+      return null;
+    }
 
-      const response = await octokit.rest.repos.getContent({
-        owner,
-        repo,
-        path: rulesPath,
-      });
-
-      const data = response.data;
-
-      if (Array.isArray(data)) {
-        console.warn(
-          `[fetchTeamRules] ⚠️  ${rulesPath} 是一个目录而非文件，跳过 RAG 加载`,
-        );
-        return null;
-      }
-
-      if (data.type !== 'file') {
-        console.warn(
-          `[fetchTeamRules] ⚠️  ${rulesPath} 的类型为 "${data.type}"，非预期的文件类型`,
-        );
-        return null;
-      }
-
-      const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
-
-      if (content.length === 0) {
-        console.log(
-          `[fetchTeamRules] ⚠️  ${rulesPath} 文件为空，本次审查将仅使用内置规则`,
-        );
-        return null;
-      }
-
-      console.log(
-        `[fetchTeamRules] ✅ 成功加载 RAG 规则 (${rulesPath})，内容长度: ${content.length} 字符`,
+    if (data.type !== 'file') {
+      console.warn(
+        `[fetchTeamRules] ⚠️  ${rulesPath} 的类型为 "${data.type}"，非预期的文件类型`,
       );
-      return content;
-    }, 'fetchTeamRules');
+      return null;
+    }
+
+    // GitHub Content API 对文件内容使用 Base64 编码
+    const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
+
+    if (content.length === 0) {
+      console.log(
+        `[fetchTeamRules] ⚠️  ${rulesPath} 文件为空，本次审查将仅使用内置规则`,
+      );
+      return null;
+    }
+
+    console.log(
+      `[fetchTeamRules] ✅ 成功加载 RAG 规则 (${rulesPath})，内容长度: ${content.length} 字符`,
+    );
+    return content;
   } catch (error: unknown) {
-    // 404 是合法状态——文件不存在，降级到纯通用规则模式
+    // ── 404 处理：文件不存在是合法的业务状态 ──
+    // GitHub API 在文件不存在时返回 404，此时不应抛异常，
+    // 而是返回 null 让上层优雅降级为「无 RAG 增强」模式。
     if (
       typeof error === 'object' &&
       error !== null &&
@@ -238,226 +178,85 @@ export async function fetchTeamRules(
       return null;
     }
 
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[fetchTeamRules] ❌ 获取团队规则时发生异常: ${message}`);
-    console.error('[fetchTeamRules] ⚠️  RAG 加载失败，审查将继续使用纯通用规则执行');
+    // ── 其他异常（网络超时、鉴权失败等）──
+    // 记录详细错误日志供运维排查，但不阻断主审查流程。
+    const message =
+      error instanceof Error ? error.message : String(error);
+    console.error(
+      `[fetchTeamRules] ❌ 获取团队规则时发生异常: ${message}`,
+    );
+    console.error(
+      '[fetchTeamRules] ⚠️  RAG 加载失败，审查将继续使用纯通用规则执行',
+    );
     return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// createPRReview — 将审查结果发布为行级 PR Review
+// createReviewComment — 将审查结果发布为 PR 评论
 // ---------------------------------------------------------------------------
 
-type UsageInfo = { promptTokens: number; completionTokens: number; totalTokens: number };
-
-function formatUsageFooter(usage?: UsageInfo): string {
-  if (!usage) return '';
-  return `\n> 📊 Token 消耗 — prompt: ${usage.promptTokens} | completion: ${usage.completionTokens} | total: ${usage.totalTokens}`;
-}
-
 /**
- * 构建 Review body（Markdown 格式）。
- * 包含 Bot 标记、意见摘要、Token 用量和通用评论。
- */
-function buildReviewBody(
-  generalComments: ReviewComment[],
-  totalInline: number,
-  usage?: UsageInfo,
-): string {
-  const header = [
-    `${BOT_MARKER}`,
-    '## 🤖 PR Review Agent — AI 代码审查报告',
-    '',
-  ];
-
-  const total = generalComments.length + totalInline;
-
-  if (total === 0) {
-    return [
-      ...header,
-      '✅ **审查完成，未发现需要关注的问题。**',
-      '',
-      '系统已对本次 PR 的代码变更进行了安全检查、逻辑审查和代码质量评估，',
-      '未检测到安全漏洞、逻辑错误或明显的代码质量问题。',
-      '',
-      '> 本评论由 PR Reviewer Agent 自动生成，基于 DeepSeek V4 模型分析。',
-      formatUsageFooter(usage),
-    ].join('\n');
-  }
-
-  const summary = [
-    `本次审查共发现 **${total}** 条意见（${totalInline} 条行级 + ${generalComments.length} 条通用），请逐条确认并修改：`,
-    '',
-  ];
-
-  let generalSection = '';
-  if (generalComments.length > 0) {
-    generalSection = [
-      '---',
-      '',
-      '### 📝 通用评论（未绑定具体代码行）',
-      '',
-      ...generalComments.map((c, i) => {
-        return [
-          `**${i + 1}. \`${c.file}\` — 第 ${c.line} 行**`,
-          '',
-          c.comment,
-          '',
-        ].join('\n');
-      }),
-      '---',
-      '',
-    ].join('\n');
-  }
-
-  const footer = [
-    '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略或在 `.github/REVIEW_RULES.md` 中调整审查规则。',
-    formatUsageFooter(usage),
-  ];
-
-  return [...header, ...summary, generalSection, ...footer].join('\n');
-}
-
-/**
- * 查找该 PR 上 Bot 之前发布的 Review ID。
- * 返回第一个匹配的 Review（按时间倒序）。
- */
-async function findPreviousBotReview(
-  octokit: Octokit,
-  owner: string,
-  repo: string,
-  prNumber: number,
-): Promise<number | null> {
-  const reviews = await octokit.rest.pulls.listReviews({
-    owner,
-    repo,
-    pull_number: prNumber,
-    per_page: 50,
-  });
-
-  for (const review of reviews.data) {
-    if (review.body && review.body.includes(BOT_MARKER)) {
-      // 如果之前的 Review 是 PENDING 状态，先 dismiss 掉
-      if (review.state === 'PENDING') {
-        try {
-          await octokit.rest.pulls.dismissReview({
-            owner,
-            repo,
-            pull_number: prNumber,
-            review_id: review.id,
-            message: 'Bot 已重新审查，此 Review 将被更新覆盖。',
-          });
-          console.log(
-            `[createPRReview] 已 dismiss 旧的 PENDING Review #${review.id}`,
-          );
-        } catch (e) {
-          console.warn(
-            `[createPRReview] 无法 dismiss Review #${review.id}: ${e instanceof Error ? e.message : String(e)}`,
-          );
-        }
-      }
-      return review.id;
-    }
-  }
-
-  return null;
-}
-
-/**
- * 将审查结果发布为 PR Review（使用 pulls.createReview 支持行级 inline comment）。
+ * 将 AI 审查的结构化结果格式化为 Markdown 并发布为 PR 评论。
  *
- * Phase 4 核心改进：
- * 1. 使用 pulls.createReview 替代 issues.createComment，支持行级评论
- * 2. 根据 position 分离 inline 评论和 body 通用评论
- * 3. 提交前先查找并清除旧的 Bot Review（防重复）
- * 4. 带指数退避重试
+ * 这是整个流水线的最后一环（闭环动作），将 JSON 结果转换为人类可读的
+ * 评论直接展示在 PR 的 Conversation 标签页中。
+ *
+ * 当审查意见为空时，发布一条正向反馈评论（告知团队未发现问题），
+ * 避免审查静默通过造成的困惑。
  *
  * @param octokit  - 已认证的 GitHub Octokit 实例
  * @param owner    - 仓库所有者
  * @param repo     - 仓库名称
  * @param prNumber - Pull Request 编号
- * @param comments - 通过校验的审查意见列表（含 position）
- * @param commitId - 当前 PR head commit SHA（用于绑定 review 到特定 commit）
+ * @param comments - 通过校验的审查意见列表
  */
-export async function createPRReview(
+export async function createReviewComment(
   octokit: Octokit,
   owner: string,
   repo: string,
   prNumber: number,
   comments: ReviewComment[],
-  commitId?: string,
-  usage?: UsageInfo,
 ): Promise<void> {
-  // 分离 inline 和 general 评论
-  const inlineComments = comments.filter((c) => c.position != null);
-  const generalComments = comments.filter((c) => c.position == null);
-
-  const body = buildReviewBody(generalComments, inlineComments.length, usage);
-
-  // 构建 GitHub API 所需的 inline comment 格式
-  const reviewComments = inlineComments.map((c) => ({
-    path: c.file,
-    position: c.position!,
-    body: c.comment,
-  }));
+  const body = formatReviewBody(comments);
 
   try {
-    await withRetry(async () => {
-      await findPreviousBotReview(octokit, owner, repo, prNumber);
-
-      console.log(
-        `[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`,
-      );
-
-      await octokit.rest.pulls.createReview({
-        owner,
-        repo,
-        pull_number: prNumber,
-        commit_id: commitId,
-        body,
-        event: 'COMMENT',
-        comments: reviewComments,
-      });
-
-      console.log(
-        `[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`,
-      );
-    }, 'createPRReview');
-  } catch (reviewError) {
-    // ── 降级：inline review 失败时回退到通用 Issue Comment ──
-    const errMsg = reviewError instanceof Error ? reviewError.message : String(reviewError);
-    console.error(
-      `[createPRReview] ❌ PR Review 发布失败: ${errMsg}`,
-    );
     console.log(
-      '[createPRReview] ⏬ 降级为通用 Issue Comment...',
+      `[createReviewComment] 正在发布审查评论到 PR #${prNumber}...`,
     );
 
-    // 将所有意见合并到 body 中（不再区分 inline/general）
-    const fallbackBody = buildFallbackBody(comments, usage);
+    await octokit.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: prNumber,
+      body,
+    });
 
-    await withRetry(async () => {
-      await octokit.rest.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNumber,
-        body: fallbackBody,
-      });
-      console.log('[createPRReview] ✅ 降级评论已成功发布');
-    }, 'createPRReview-fallback');
+    console.log(
+      `[createReviewComment] ✅ 审查评论已成功发布（${comments.length} 条意见）`,
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+    console.error(
+      `[createReviewComment] ❌ 发布评论失败: ${message}`,
+    );
+    throw error;
   }
 }
 
 /**
- * 构建降级评论 body：将全部意见转为通用 Markdown 评论。
+ * 将审查意见列表格式化为 Markdown 文本。
+ *
+ * 输出格式：
+ * - 标题行（含机器人标识）
+ * - 意见条数统计
+ * - 每条意见：文件路径 + 行号 + 问题描述 + 修复建议
+ * - 当无意见时输出正向反馈
  */
-function buildFallbackBody(comments: ReviewComment[], usage?: UsageInfo): string {
+function formatReviewBody(comments: ReviewComment[]): string {
   const header = [
-    `${BOT_MARKER}`,
     '## 🤖 PR Review Agent — AI 代码审查报告',
-    '',
-    '> ⚠️ 行级 Review 发布失败，已降级为通用评论。',
     '',
   ];
 
@@ -466,10 +265,19 @@ function buildFallbackBody(comments: ReviewComment[], usage?: UsageInfo): string
       ...header,
       '✅ **审查完成，未发现需要关注的问题。**',
       '',
-      '> 本评论由 PR Reviewer Agent 自动生成。',
-      formatUsageFooter(usage),
+      '系统已对本次 PR 的 diff 进行了安全检查、逻辑审查和代码质量评估，',
+      '未检测到安全漏洞、逻辑错误或明显的代码质量问题。',
+      '',
+      '> 本评论由 PR Reviewer Agent 自动生成，基于 DeepSeek V4 模型分析。',
     ].join('\n');
   }
+
+  const summary = [
+    `本次审查共发现 **${comments.length}** 条意见，请逐条确认并修改：`,
+    '',
+    '---',
+    '',
+  ];
 
   const items = comments.map((c, i) => {
     return [
@@ -483,9 +291,8 @@ function buildFallbackBody(comments: ReviewComment[], usage?: UsageInfo): string
   });
 
   const footer = [
-    '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略。',
-    formatUsageFooter(usage),
+    '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略或在 `.github/REVIEW_RULES.md` 中调整审查规则。',
   ];
 
-  return [...header, `本次审查共发现 **${comments.length}** 条意见：`, '', ...items, ...footer].join('\n');
+  return [...header, ...summary, ...items, ...footer].join('\n');
 }

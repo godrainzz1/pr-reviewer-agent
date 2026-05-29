@@ -2,12 +2,6 @@ name: Test My Agent
 on:
   pull_request: # 只有当有人提 PR 时，Agent 才会苏醒
     types: [opened, synchronize]
-
-# Phase 4: 显式并发控制 —— 同一 PR 的新 push 自动取消旧的审查
-concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -18,13 +12,4 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }} # GitHub 自带的权限令牌
           openai-key: ${{ secrets.OPENAI_API_KEY }}
-          openai-base-url: “https://api.deepseek.com/v1” # 指向 DeepSeek
-
-      - name: Upload token usage log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: token-usage-pr-${{ github.event.pull_request.number }}
-          path: token-usage.jsonl
-          retention-days: 30
-          if-no-files-found: warn
+          openai-base-url: "https://api.deepseek.com/v1" # 指向 DeepSeek
