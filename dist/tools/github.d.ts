@@ -58,19 +58,12 @@ export declare function fetchPRDiff(octokit: Octokit, owner: string, repo: strin
  */
 export declare function fetchTeamRules(octokit: Octokit, owner: string, repo: string): Promise<string | null>;
 /**
- * 将 AI 审查的结构化结果格式化为 Markdown 并发布为 PR 评论。
+ * 将 AI 审查的结构化结果发布为 PR Review。
  *
- * 这是整个流水线的最后一环（闭环动作），将 JSON 结果转换为人类可读的
- * 评论直接展示在 PR 的 Conversation 标签页中。
+ * Phase 3 升级：使用 pulls.createReview 替代 issues.createComment，
+ * 支持行级 inline comment（评论直接标注在 diff 的代码行上）。
  *
- * 当审查意见为空时，发布一条正向反馈评论（告知团队未发现问题），
- * 避免审查静默通过造成的困惑。
- *
- * @param octokit  - 已认证的 GitHub Octokit 实例
- * @param owner    - 仓库所有者
- * @param repo     - 仓库名称
- * @param prNumber - Pull Request 编号
- * @param comments - 通过校验的审查意见列表
+ * 对有 diff position 的条目发 inline comment；无法映射的降级为 body 通用评论。
  */
-export declare function createReviewComment(octokit: Octokit, owner: string, repo: string, prNumber: number, comments: ReviewComment[]): Promise<void>;
+export declare function createReviewComment(octokit: Octokit, owner: string, repo: string, prNumber: number, comments: ReviewComment[], diff: string, commitId?: string): Promise<void>;
 export {};
