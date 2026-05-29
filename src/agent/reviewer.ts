@@ -14,6 +14,7 @@
 
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { logTokenUsage } from '../tools/logger.js';
 
 // ---------------------------------------------------------------------------
 // 导出类型定义
@@ -578,6 +579,16 @@ export async function analyzeCode(
       console.log(
         `[analyzeCode] 实际 Token 用量 — prompt: ${completion.usage?.prompt_tokens ?? 'N/A'}, completion: ${completion.usage?.completion_tokens ?? 'N/A'}, total: ${completion.usage?.total_tokens ?? 'N/A'}`,
       );
+
+      // ─── 6.5 持久化 Token 消耗日志 ───
+      if (completion.usage) {
+        logTokenUsage({
+          model,
+          promptTokens: completion.usage.prompt_tokens,
+          completionTokens: completion.usage.completion_tokens,
+          totalTokens: completion.usage.total_tokens,
+        });
+      }
 
       // ─── 7. JSON 防幻觉校验（第二层 + 第三层防线）───
       const validComments = parseAndValidateResponse(rawContent);

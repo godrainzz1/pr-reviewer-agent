@@ -13,6 +13,7 @@ import { getInput, setFailed } from '@actions/core';
 import { getOctokit, context } from '@actions/github';
 import { fetchPRDiff, fetchTeamRules, createReviewComment } from './tools/github.js';
 import { analyzeCode } from './agent/reviewer.js';
+import { logTokenUsage } from './tools/logger.js';
 
 async function run(): Promise<void> {
   try {
@@ -46,6 +47,14 @@ async function run(): Promise<void> {
       console.log(
         `[index] 💰 Token 用量 — prompt: ${result.usage.promptTokens}, completion: ${result.usage.completionTokens}, total: ${result.usage.totalTokens}`,
       );
+      logTokenUsage({
+        model: 'deepseek-chat',
+        promptTokens: result.usage.promptTokens,
+        completionTokens: result.usage.completionTokens,
+        totalTokens: result.usage.totalTokens,
+        prNumber,
+        repo: `${owner}/${repo}`,
+      });
     }
 
     // ─── 6. 将审查结果发布为 PR 评论（闭环的最后一步）───
