@@ -48598,6 +48598,7 @@ async function run() {
         const githubToken = getInput('github-token', { required: true });
         const openaiKey = getInput('openai-key', { required: true });
         const openaiBaseUrl = (getInput('openai-base-url') || 'https://api.deepseek.com').trim();
+        process.env.OPENAI_BASE_URL = openaiBaseUrl;
         console.log(`[index] 🔗 使用 API Base URL: "${openaiBaseUrl}"`);
         // ─── 2. 从 Actions 上下文提取 PR 信息 ───
         const octokit = getOctokit(githubToken);
