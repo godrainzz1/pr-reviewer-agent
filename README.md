@@ -140,7 +140,8 @@ pr-reviewer-agent/
 │   ├── agent/
 │   │   └── reviewer.ts             # AI 引擎 —— Prompt 构建 + JSON 防幻觉 + LLM 调用
 │   └── tools/
-│       └── github.ts               # GitHub 工具层 —— diff 获取 + 规范拉取 + 评论发布
+│       ├── github.ts               # GitHub 工具层 —— diff 获取 + 规范拉取 + 评论发布
+│       └── logger.ts               # Token 日志 —— JSON Lines 格式持久化每次调用的消耗
 ├── dist/                           # ncc 编译产物（单文件，可直接在 Action 中运行）
 ├── action.yml                      # GitHub Action 描述文件
 ├── tsconfig.json
@@ -231,12 +232,13 @@ ci: add dogfooding workflow to test agent
 
 | 文件 | 代码行数 | 我写的行数 |
 |------|----------|------------|
-| `src/index.ts` | 63 | 0 |
-| `src/agent/reviewer.ts` | 622 | 0 |
+| `src/index.ts` | 72 | 0 |
+| `src/agent/reviewer.ts` | 633 | 0 |
 | `src/tools/github.ts` | 298 | 0 |
+| `src/tools/logger.ts` | 71 | 0 |
 | `action.yml` | 23 | 0 |
 | `.github/workflows/test-agent.yml` | 15 | 0 |
-| **合计** | **~1020** | **0** |
+| **合计** | **~1112** | **0** |
 
 > 我所做的就是不断告诉 CLAUDE.md："你是谁、你要做什么、你不能做什么、你要按什么顺序做"。
 > 

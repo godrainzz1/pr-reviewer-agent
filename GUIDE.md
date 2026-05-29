@@ -117,6 +117,33 @@
 
 ---
 
+#### `src/tools/logger.ts` — Token 消耗日志
+**作用**: 将每次 LLM 调用的 Token 消耗以 **JSON Lines 格式**（`.jsonl`）持久化写入 `token-usage.jsonl` 文件。
+
+提供的公开 API：
+
+| 函数 | 职责 |
+|---|---|
+| `logTokenUsage(entry)` | 追加一条包含 timestamp、model、promptTokens、completionTokens、totalTokens、prNumber、repo 的 JSON 行到日志文件 |
+
+每条日志格式示例：
+```json
+{"timestamp":"2026-05-29T10:30:00.000Z","model":"deepseek-chat","promptTokens":3200,"completionTokens":450,"totalTokens":3650,"prNumber":7,"repo":"org/repo"}
+```
+
+设计原则：
+- **不阻断主流程**: 写入失败仅输出 `console.error`，绝不抛异常
+- **JSON Lines 格式**: 每行一个独立 JSON 对象，便于用 `tail`、`jq`、`grep` 等标准工具解析，也可导入 Excel / Pandas 做统计
+- **追加写入**: 使用 `appendFileSync`，无需在内存中维护文件内容
+
+调用点（两处）：
+- `src/agent/reviewer.ts` — 每次 LLM API 调用成功后，记录 model + 3 项 token 数
+- `src/index.ts` — 审查流水线完成后，补充 prNumber 和 repo 上下文
+
+**为什么存在**: 长期追踪 Token 消耗，用于成本审计、用量优化和模型选型对比。在 GitHub Actions runner 上该文件为临时文件（job 结束后销毁），若需长期保留可在 workflow 中添加 `actions/upload-artifact` 步骤。
+
+---
+
 #### `src/agent/reviewer.ts` — AI 审查引擎
 **作用**: 封装与 DeepSeek V4 模型交互的全部逻辑。这是整个系统中最复杂的模块。
 
