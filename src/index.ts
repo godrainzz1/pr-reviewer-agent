@@ -25,9 +25,10 @@ async function run(): Promise<void> {
     const octokit = getOctokit(githubToken);
     const { owner, repo } = context.repo;
     const prNumber = context.issue.number;
+    const commitId = context.sha;
 
     console.log(
-      `[index] 🚀 开始审查 PR #${prNumber} (${owner}/${repo})`,
+      `[index] 🚀 开始审查 PR #${prNumber} (${owner}/${repo}) @ ${commitId.slice(0, 7)}`,
     );
 
     // ─── 3. 获取 PR 的 unified diff ───
@@ -48,8 +49,8 @@ async function run(): Promise<void> {
       );
     }
 
-    // ─── 6. 将审查结果发布为 PR 评论（闭环的最后一步）───
-    await createReviewComment(octokit, owner, repo, prNumber, result.comments);
+    // ─── 6. 将审查结果发布为行级 PR Review（闭环的最后一步）───
+    await createReviewComment(octokit, owner, repo, prNumber, result.comments, diff, commitId);
 
     console.log('[index] ✅ 审查流水线全部完成');
   } catch (error) {
