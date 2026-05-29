@@ -2,6 +2,12 @@ name: Test My Agent
 on:
   pull_request: # 只有当有人提 PR 时，Agent 才会苏醒
     types: [opened, synchronize]
+
+# Phase 4: 显式并发控制 —— 同一 PR 的新 push 自动取消旧的审查
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest

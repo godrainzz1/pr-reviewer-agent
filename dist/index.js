@@ -36308,116 +36308,163 @@ function getOctokit(token, options, ...additionalPlugins) {
  * 职责：
  * 1. 从 GitHub API 获取 PR 的 unified diff 文本
  * 2. 从目标仓库拉取团队自定义审查规则（轻量级 RAG 知识源）
+ * 3. 将审查结果发布为行级 PR Review（inline comments）
  *
- * 所有网络调用均包含异常兜底处理，并通过 console.log 输出关键状态，
- * 便于在 GitHub Actions 日志中追踪执行过程。
+ * Phase 4 增强：
+ * - 指数退避重试（Exponential Backoff）用于所有 API 调用
+ * - 重复评论防护（查找并覆盖旧的 Bot Review）
+ * - diff position 映射支持行级 inline comment
  */
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+/** 最大重试次数（不含首次调用） */
+const MAX_RETRIES = 4;
+/** 初始退避延迟（毫秒） */
+const BASE_DELAY_MS = 1000;
+/** Bot 标识 HTML 注释，用于查找和识别自家的 Review */
+const BOT_MARKER = '<!-- pr-reviewer-agent-bot -->';
+// ---------------------------------------------------------------------------
+// 指数退避重试工具
+// ---------------------------------------------------------------------------
+/**
+ * 判断错误是否可重试。
+ * - 429 Rate Limit → 重试（遵守 Retry-After）
+ * - 5xx 服务端错误 → 重试
+ * - 网络层错误（timeout, ECONNREFUSED, etc.）→ 重试
+ * - 401/403/404 → 不重试（404 在 fetchTeamRules 中特殊处理）
+ */
+function isRetryableError(error) {
+    if (error instanceof Error) {
+        const msg = error.message.toLowerCase();
+        if (msg.includes('timeout') ||
+            msg.includes('econnrefused') ||
+            msg.includes('econnreset') ||
+            msg.includes('enetunreach') ||
+            msg.includes('socket hang up')) {
+            return true;
+        }
+    }
+    if (typeof error === 'object' && error !== null && 'status' in error) {
+        const status = error.status;
+        if (status === 429)
+            return true;
+        if (status >= 500 && status < 600)
+            return true;
+        return false;
+    }
+    return false;
+}
+/**
+ * 从错误对象中提取 Retry-After 响应头（用于 429 限流）。
+ */
+function extractRetryAfter(error) {
+    if (typeof error === 'object' &&
+        error !== null &&
+        'response' in error) {
+        const response = error.response;
+        if (response?.headers) {
+            const header = response.headers['retry-after'];
+            if (header) {
+                const seconds = parseInt(header, 10);
+                if (!isNaN(seconds))
+                    return seconds * 1000;
+                const date = Date.parse(header);
+                if (!isNaN(date))
+                    return Math.max(0, date - Date.now());
+            }
+        }
+    }
+    return null;
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/**
+ * 对异步操作执行指数退避重试。
+ *
+ * 策略：初始延迟 1s → 2s → 4s → 8s（最多 4 次重试）。
+ * 429 错误的 Retry-After 头优先于计算延迟。
+ *
+ * @param fn       - 要执行的异步函数
+ * @param label    - 日志标签
+ * @param maxRetries - 最大重试次数
+ * @returns 函数返回值
+ */
+async function withRetry(fn, label, maxRetries = MAX_RETRIES) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        }
+        catch (error) {
+            lastError = error;
+            if (attempt >= maxRetries || !isRetryableError(error)) {
+                break;
+            }
+            // 遵守 429 Retry-After
+            const retryAfter = extractRetryAfter(error);
+            const computedDelay = BASE_DELAY_MS * Math.pow(2, attempt);
+            const delayMs = retryAfter ?? computedDelay;
+            console.warn(`[${label}] ⏳ 第 ${attempt + 1} 次调用失败，${delayMs}ms 后重试 (${attempt + 2}/${maxRetries + 1})...`);
+            await sleep(delayMs);
+        }
+    }
+    throw lastError;
+}
 // ---------------------------------------------------------------------------
 // fetchPRDiff — 获取 PR 的 diff 文本
 // ---------------------------------------------------------------------------
-/**
- * 获取指定 Pull Request 的完整 unified diff 文本。
- *
- * 通过设置 mediaType 为 `diff` 格式，GitHub REST API 会直接返回
- * 纯文本 diff（而非 JSON 对象），这正是后续 LLM 审查所需的输入格式。
- *
- * @param octokit  - 已认证的 GitHub Octokit 实例
- * @param owner    - 仓库所有者（组织名或用户名）
- * @param repo     - 仓库名称
- * @param prNumber - Pull Request 编号
- * @returns PR 的完整 diff 文本字符串
- * @throws  当网络异常或 PR 不存在时抛出错误
- */
 async function fetchPRDiff(octokit, owner, repo, prNumber) {
-    try {
+    return withRetry(async () => {
         console.log(`[fetchPRDiff] 正在获取 PR #${prNumber} 的 diff 文本...`);
-        // GitHub REST API: get a pull request
-        // 通过 mediaType.format = 'diff' 让 API 返回纯文本 diff 而非 JSON
         const response = await octokit.rest.pulls.get({
             owner,
             repo,
             pull_number: prNumber,
-            mediaType: {
-                format: 'diff',
-            },
+            mediaType: { format: 'diff' },
         });
-        // 当 mediaType 为 diff 时，response.data 在运行时为 string，
-        // 但 TS 类型推断仍基于默认 JSON schema，因此需要显式断言。
         const diff = response.data;
         if (typeof diff !== 'string' || diff.length === 0) {
             throw new Error('GitHub API 返回的 diff 为空或类型异常');
         }
         console.log(`[fetchPRDiff] ✅ 成功获取 diff，长度: ${diff.length} 字符`);
         return diff;
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`[fetchPRDiff] ❌ 获取 PR diff 失败: ${message}`);
-        throw error;
-    }
+    }, 'fetchPRDiff');
 }
 // ---------------------------------------------------------------------------
 // fetchTeamRules — 轻量级 RAG 知识源加载
 // ---------------------------------------------------------------------------
-/**
- * 尝试从目标仓库读取团队自定义审查规则文件。
- *
- * ── 轻量级 RAG 机制说明 ──
- *
- * 本项目的 RAG（Retrieval-Augmented Generation）采用最简实现：
- * 1. 【检索（Retrieval）】: 从目标仓库拉取 `.github/REVIEW_RULES.md`
- *    作为外部知识文档。该文件由各仓库的团队自行维护，包含项目特定的
- *    编码约定（如：命名规范、目录结构约定、禁用模式等）。
- * 2. 【增强（Augmented）】: 将该文件内容作为上下文注入到 LLM 的
- *    系统提示词中（见 src/agent/reviewer.ts 的 buildSystemPrompt）。
- * 3. 【生成（Generation）】: LLM 同时参考「通用审查最佳实践」和
- *    「团队特定规范」生成最终的审查意见。
- *
- * 这种方案无需向量数据库或 Embedding，适合单文件、轻量级的场景。
- *
- * 异常处理策略：
- * - 文件不存在（404）→ 返回 null，审查继续，仅使用通用规则
- * - 其他网络/鉴权错误 → 返回 null，记录日志，不阻断主审查流程
- * - 只有调用方明确需要 RAG 且获取失败时才抛异常
- *
- * @param octokit - 已认证的 GitHub Octokit 实例
- * @param owner   - 仓库所有者
- * @param repo    - 仓库名称
- * @returns 规则文件的 Markdown 文本内容，或 null（表示未找到/获取失败）
- */
 async function fetchTeamRules(octokit, owner, repo) {
     const rulesPath = '.github/REVIEW_RULES.md';
     try {
-        console.log(`[fetchTeamRules] 正在尝试加载团队审查规则 (${rulesPath})...`);
-        // 调用 GitHub Content API 读取仓库中的文件内容
-        const response = await octokit.rest.repos.getContent({
-            owner,
-            repo,
-            path: rulesPath,
-        });
-        const data = response.data;
-        // getContent 对目录返回数组，对文件返回单个对象
-        if (Array.isArray(data)) {
-            console.warn(`[fetchTeamRules] ⚠️  ${rulesPath} 是一个目录而非文件，跳过 RAG 加载`);
-            return null;
-        }
-        if (data.type !== 'file') {
-            console.warn(`[fetchTeamRules] ⚠️  ${rulesPath} 的类型为 "${data.type}"，非预期的文件类型`);
-            return null;
-        }
-        // GitHub Content API 对文件内容使用 Base64 编码
-        const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
-        if (content.length === 0) {
-            console.log(`[fetchTeamRules] ⚠️  ${rulesPath} 文件为空，本次审查将仅使用内置规则`);
-            return null;
-        }
-        console.log(`[fetchTeamRules] ✅ 成功加载 RAG 规则 (${rulesPath})，内容长度: ${content.length} 字符`);
-        return content;
+        return await withRetry(async () => {
+            console.log(`[fetchTeamRules] 正在尝试加载团队审查规则 (${rulesPath})...`);
+            const response = await octokit.rest.repos.getContent({
+                owner,
+                repo,
+                path: rulesPath,
+            });
+            const data = response.data;
+            if (Array.isArray(data)) {
+                console.warn(`[fetchTeamRules] ⚠️  ${rulesPath} 是一个目录而非文件，跳过 RAG 加载`);
+                return null;
+            }
+            if (data.type !== 'file') {
+                console.warn(`[fetchTeamRules] ⚠️  ${rulesPath} 的类型为 "${data.type}"，非预期的文件类型`);
+                return null;
+            }
+            const content = Buffer.from(data.content, 'base64').toString('utf-8').trim();
+            if (content.length === 0) {
+                console.log(`[fetchTeamRules] ⚠️  ${rulesPath} 文件为空，本次审查将仅使用内置规则`);
+                return null;
+            }
+            console.log(`[fetchTeamRules] ✅ 成功加载 RAG 规则 (${rulesPath})，内容长度: ${content.length} 字符`);
+            return content;
+        }, 'fetchTeamRules');
     }
     catch (error) {
-        // ── 404 处理：文件不存在是合法的业务状态 ──
-        // GitHub API 在文件不存在时返回 404，此时不应抛异常，
-        // 而是返回 null 让上层优雅降级为「无 RAG 增强」模式。
+        // 404 是合法状态——文件不存在，降级到纯通用规则模式
         if (typeof error === 'object' &&
             error !== null &&
             'status' in error &&
@@ -36425,8 +36472,6 @@ async function fetchTeamRules(octokit, owner, repo) {
             console.log(`[fetchTeamRules] ℹ️  未找到 ${rulesPath}（404），本次审查将仅使用内置通用规则`);
             return null;
         }
-        // ── 其他异常（网络超时、鉴权失败等）──
-        // 记录详细错误日志供运维排查，但不阻断主审查流程。
         const message = error instanceof Error ? error.message : String(error);
         console.error(`[fetchTeamRules] ❌ 获取团队规则时发生异常: ${message}`);
         console.error('[fetchTeamRules] ⚠️  RAG 加载失败，审查将继续使用纯通用规则执行');
@@ -36434,86 +36479,135 @@ async function fetchTeamRules(octokit, owner, repo) {
     }
 }
 // ---------------------------------------------------------------------------
-// createReviewComment — 将审查结果发布为 PR 评论
+// createPRReview — 将审查结果发布为行级 PR Review
 // ---------------------------------------------------------------------------
 /**
- * 将 AI 审查的结构化结果格式化为 Markdown 并发布为 PR 评论。
- *
- * 这是整个流水线的最后一环（闭环动作），将 JSON 结果转换为人类可读的
- * 评论直接展示在 PR 的 Conversation 标签页中。
- *
- * 当审查意见为空时，发布一条正向反馈评论（告知团队未发现问题），
- * 避免审查静默通过造成的困惑。
- *
- * @param octokit  - 已认证的 GitHub Octokit 实例
- * @param owner    - 仓库所有者
- * @param repo     - 仓库名称
- * @param prNumber - Pull Request 编号
- * @param comments - 通过校验的审查意见列表
+ * 构建 Review body（Markdown 格式）。
+ * 包含 Bot 标记、意见摘要和通用评论。
  */
-async function createReviewComment(octokit, owner, repo, prNumber, comments) {
-    const body = formatReviewBody(comments);
-    try {
-        console.log(`[createReviewComment] 正在发布审查评论到 PR #${prNumber}...`);
-        await octokit.rest.issues.createComment({
-            owner,
-            repo,
-            issue_number: prNumber,
-            body,
-        });
-        console.log(`[createReviewComment] ✅ 审查评论已成功发布（${comments.length} 条意见）`);
-    }
-    catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`[createReviewComment] ❌ 发布评论失败: ${message}`);
-        throw error;
-    }
-}
-/**
- * 将审查意见列表格式化为 Markdown 文本。
- *
- * 输出格式：
- * - 标题行（含机器人标识）
- * - 意见条数统计
- * - 每条意见：文件路径 + 行号 + 问题描述 + 修复建议
- * - 当无意见时输出正向反馈
- */
-function formatReviewBody(comments) {
+function buildReviewBody(generalComments, totalInline) {
     const header = [
+        `${BOT_MARKER}`,
         '## 🤖 PR Review Agent — AI 代码审查报告',
         '',
     ];
-    if (comments.length === 0) {
+    const total = generalComments.length + totalInline;
+    if (total === 0) {
         return [
             ...header,
             '✅ **审查完成，未发现需要关注的问题。**',
             '',
-            '系统已对本次 PR 的 diff 进行了安全检查、逻辑审查和代码质量评估，',
+            '系统已对本次 PR 的代码变更进行了安全检查、逻辑审查和代码质量评估，',
             '未检测到安全漏洞、逻辑错误或明显的代码质量问题。',
             '',
             '> 本评论由 PR Reviewer Agent 自动生成，基于 DeepSeek V4 模型分析。',
         ].join('\n');
     }
     const summary = [
-        `本次审查共发现 **${comments.length}** 条意见，请逐条确认并修改：`,
-        '',
-        '---',
+        `本次审查共发现 **${total}** 条意见（${totalInline} 条行级 + ${generalComments.length} 条通用），请逐条确认并修改：`,
         '',
     ];
-    const items = comments.map((c, i) => {
-        return [
-            `### ${i + 1}. \`${c.file}\` — 第 ${c.line} 行`,
+    // 通用评论（无行号的）
+    let generalSection = '';
+    if (generalComments.length > 0) {
+        generalSection = [
+            '---',
             '',
-            c.comment,
+            '### 📝 通用评论（未绑定具体代码行）',
             '',
+            ...generalComments.map((c, i) => {
+                return [
+                    `**${i + 1}. \`${c.file}\` — 第 ${c.line} 行**`,
+                    '',
+                    c.comment,
+                    '',
+                ].join('\n');
+            }),
             '---',
             '',
         ].join('\n');
-    });
+    }
     const footer = [
         '> ⚡ 本评论由 PR Reviewer Agent 自动生成。如有误报请忽略或在 `.github/REVIEW_RULES.md` 中调整审查规则。',
     ];
-    return [...header, ...summary, ...items, ...footer].join('\n');
+    return [...header, ...summary, generalSection, ...footer].join('\n');
+}
+/**
+ * 查找该 PR 上 Bot 之前发布的 Review ID。
+ * 返回第一个匹配的 Review（按时间倒序）。
+ */
+async function findPreviousBotReview(octokit, owner, repo, prNumber) {
+    const reviews = await octokit.rest.pulls.listReviews({
+        owner,
+        repo,
+        pull_number: prNumber,
+        per_page: 50,
+    });
+    for (const review of reviews.data) {
+        if (review.body && review.body.includes(BOT_MARKER)) {
+            // 如果之前的 Review 是 PENDING 状态，先 dismiss 掉
+            if (review.state === 'PENDING') {
+                try {
+                    await octokit.rest.pulls.dismissReview({
+                        owner,
+                        repo,
+                        pull_number: prNumber,
+                        review_id: review.id,
+                        message: 'Bot 已重新审查，此 Review 将被更新覆盖。',
+                    });
+                    console.log(`[createPRReview] 已 dismiss 旧的 PENDING Review #${review.id}`);
+                }
+                catch (e) {
+                    console.warn(`[createPRReview] 无法 dismiss Review #${review.id}: ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+            return review.id;
+        }
+    }
+    return null;
+}
+/**
+ * 将审查结果发布为 PR Review（使用 pulls.createReview 支持行级 inline comment）。
+ *
+ * Phase 4 核心改进：
+ * 1. 使用 pulls.createReview 替代 issues.createComment，支持行级评论
+ * 2. 根据 position 分离 inline 评论和 body 通用评论
+ * 3. 提交前先查找并清除旧的 Bot Review（防重复）
+ * 4. 带指数退避重试
+ *
+ * @param octokit  - 已认证的 GitHub Octokit 实例
+ * @param owner    - 仓库所有者
+ * @param repo     - 仓库名称
+ * @param prNumber - Pull Request 编号
+ * @param comments - 通过校验的审查意见列表（含 position）
+ * @param commitId - 当前 PR head commit SHA（用于绑定 review 到特定 commit）
+ */
+async function createPRReview(octokit, owner, repo, prNumber, comments, commitId) {
+    // 分离 inline 和 general 评论
+    const inlineComments = comments.filter((c) => c.position != null);
+    const generalComments = comments.filter((c) => c.position == null);
+    const body = buildReviewBody(generalComments, inlineComments.length);
+    // 构建 GitHub API 所需的 inline comment 格式
+    const reviewComments = inlineComments.map((c) => ({
+        path: c.file,
+        position: c.position,
+        body: c.comment,
+    }));
+    await withRetry(async () => {
+        // ── 去重：查找并 dismiss 旧的 Bot pending Review ──
+        await findPreviousBotReview(octokit, owner, repo, prNumber);
+        console.log(`[createPRReview] 正在发布 PR Review: ${reviewComments.length} 条 inline + ${generalComments.length} 条 general`);
+        await octokit.rest.pulls.createReview({
+            owner,
+            repo,
+            pull_number: prNumber,
+            commit_id: commitId,
+            body,
+            event: 'COMMENT',
+            comments: reviewComments,
+        });
+        console.log(`[createPRReview] ✅ Review 已成功发布（${reviewComments.length} inline + ${generalComments.length} general）`);
+    }, 'createPRReview');
 }
 
 ;// CONCATENATED MODULE: ./node_modules/openai/internal/tslib.mjs
@@ -36834,7 +36928,7 @@ const safeJSON = (text) => {
 //# sourceMappingURL=values.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/openai/internal/utils/sleep.mjs
 // File generated from our OpenAPI spec by Stainless. See CONTRIBUTING.md for details.
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep_sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //# sourceMappingURL=sleep.mjs.map
 ;// CONCATENATED MODULE: ./node_modules/openai/version.mjs
 const openai_version_VERSION = '6.39.0'; // x-release-please-version
@@ -44226,7 +44320,7 @@ class Runs extends APIResource {
                             }
                         }
                     }
-                    await sleep(sleepInterval);
+                    await sleep_sleep(sleepInterval);
                     break;
                 //We return the run in any terminal state.
                 case 'requires_action':
@@ -44945,7 +45039,7 @@ class files_Files extends APIResource {
         const start = Date.now();
         let file = await this.retrieve(id);
         while (!file.status || !TERMINAL_STATES.has(file.status)) {
-            await sleep(pollInterval);
+            await sleep_sleep(pollInterval);
             file = await this.retrieve(id);
             if (Date.now() - start > maxWait) {
                 throw new APIConnectionTimeoutError({
@@ -46508,7 +46602,7 @@ class FileBatches extends APIResource {
                             }
                         }
                     }
-                    await sleep(sleepInterval);
+                    await sleep_sleep(sleepInterval);
                     break;
                 case 'failed':
                 case 'cancelled':
@@ -46660,7 +46754,7 @@ class vector_stores_files_Files extends APIResource {
                             }
                         }
                     }
-                    await sleep(sleepInterval);
+                    await sleep_sleep(sleepInterval);
                     break;
                 case 'failed':
                 case 'completed':
@@ -47562,7 +47656,7 @@ class OpenAI {
             const maxRetries = options.maxRetries ?? this.maxRetries;
             timeoutMillis = this.calculateDefaultRetryTimeoutMillis(retriesRemaining, maxRetries);
         }
-        await sleep(timeoutMillis);
+        await sleep_sleep(timeoutMillis);
         return this.makeRequest(options, retriesRemaining - 1, requestLogID);
     }
     calculateDefaultRetryTimeoutMillis(retriesRemaining, maxRetries) {
@@ -47835,6 +47929,222 @@ const _deployments_endpoints = new Set([
 
 
 //# sourceMappingURL=index.mjs.map
+;// CONCATENATED MODULE: external "node:fs"
+const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
+;// CONCATENATED MODULE: external "node:path"
+const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
+;// CONCATENATED MODULE: ./src/tools/logger.ts
+/**
+ * src/tools/logger.ts
+ * —— Token 消耗日志持久化 ——
+ *
+ * 职责：
+ * 将每次 LLM 调用的 Token 消耗以 JSON Lines 格式追加写入日志文件，
+ * 便于成本追踪、用量审计和历史对比。
+ */
+
+
+// ---------------------------------------------------------------------------
+// 配置
+// ---------------------------------------------------------------------------
+/** 日志文件相对于项目根目录的路径 */
+const LOG_FILE = (0,external_node_path_namespaceObject.join)(process.cwd(), 'token-usage.jsonl');
+// ---------------------------------------------------------------------------
+// 公开 API
+// ---------------------------------------------------------------------------
+/**
+ * 向 token-usage.jsonl 追加一条 Token 消耗记录。
+ *
+ * 采用 JSON Lines 格式（每行一个 JSON 对象），便于：
+ * - 逐行追加（无需重写整个文件）
+ * - 用 jq / grep / tail 等标准工具解析
+ * - 按需导入 Excel / Pandas 做统计分析
+ *
+ * 写入失败时仅输出 console.error，不抛异常——
+ * Token 日志不应阻断主审查流水线。
+ *
+ * @param entry - Token 消耗明细
+ */
+function logTokenUsage(entry) {
+    const line = {
+        timestamp: new Date().toISOString(),
+        ...entry,
+    };
+    try {
+        (0,external_node_fs_namespaceObject.appendFileSync)(LOG_FILE, JSON.stringify(line) + '\n', 'utf-8');
+        console.log(`[logTokenUsage] ✅ 已记录 Token 消耗: ${entry.totalTokens} tokens (${LOG_FILE})`);
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[logTokenUsage] ❌ 写入日志失败 (${LOG_FILE}): ${message}`);
+    }
+}
+
+;// CONCATENATED MODULE: ./src/tools/diff-parser.ts
+/**
+ * src/tools/diff-parser.ts
+ * ── Diff 解析引擎 ──
+ *
+ * 职责：
+ * 1. 解析 unified diff 格式，提取文件路径和 hunk 信息
+ * 2. 构建物理行号 → diff position 映射表
+ * 3. 提供文件/行号级别的查询接口供 reviewer 校验使用
+ * 4. 过滤无需审查的配置文件
+ */
+// ---------------------------------------------------------------------------
+// 常量：不带审查的文件模式
+// ---------------------------------------------------------------------------
+const SKIP_PATTERNS = [
+    /\.json$/i,
+    /\.lock$/i,
+    /\.yml$/i,
+    /\.yaml$/i,
+    /\.md$/i,
+    /^dist\//,
+    /^\.github\//,
+];
+function shouldSkipFile(filePath) {
+    return SKIP_PATTERNS.some((p) => p.test(filePath));
+}
+// ---------------------------------------------------------------------------
+// 公开 API
+// ---------------------------------------------------------------------------
+/**
+ * 解析 unified diff 文本，提取所有文件的 hunk 信息。
+ *
+ * 仅处理代码文件（排除 .json / .lock / .yml / .yaml / .md / dist / .github）。
+ *
+ * @param rawDiff - 原始 unified diff 文本
+ * @returns 结构化的 diff 解析结果
+ */
+function parseDiff(rawDiff) {
+    const files = new Map();
+    const lines = rawDiff.split('\n');
+    let currentFile = null;
+    let diffPosition = 0;
+    for (const line of lines) {
+        diffPosition++;
+        // ── 文件头行：提取新增侧文件路径 ──
+        const newFileMatch = line.match(/^\+\+\+ b\/(.+)$/);
+        if (newFileMatch) {
+            const filePath = newFileMatch[1];
+            // 跳过不需要审查的文件
+            if (shouldSkipFile(filePath)) {
+                currentFile = null;
+                continue;
+            }
+            currentFile = {
+                path: filePath,
+                hunks: [],
+                lines: [],
+                addedLines: new Set(),
+                lineToPosition: new Map(),
+            };
+            files.set(filePath, currentFile);
+            continue;
+        }
+        if (!currentFile)
+            continue;
+        // ── hunk header ──
+        const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+        if (hunkMatch) {
+            const newStart = parseInt(hunkMatch[3], 10);
+            const newCount = parseInt(hunkMatch[4] || '1', 10);
+            const hunk = {
+                header: line,
+                newStart,
+                newCount,
+                lines: [],
+            };
+            currentFile.hunks.push(hunk);
+            let physicalLine = newStart;
+            // 遍历 hunk 内的行
+            for (const hunkLine of lines.slice(diffPosition)) {
+                diffPosition++;
+                if (hunkLine.startsWith('@@') && !hunkLine.startsWith(line)) {
+                    // 下一个 hunk 开始了，回退 diffPosition
+                    diffPosition--;
+                    break;
+                }
+                // 跳过空行（diff 末尾）
+                if (hunkLine === '') {
+                    // 如果是文件末尾的空行，可能是下一个文件分隔符
+                    continue;
+                }
+                const kind = hunkLine.startsWith('+')
+                    ? '+'
+                    : hunkLine.startsWith('-')
+                        ? '-'
+                        : ' ';
+                const hl = {
+                    content: hunkLine.slice(1),
+                    diffPosition,
+                    physicalLine: kind !== '-' ? physicalLine : -(physicalLine - 1),
+                    kind,
+                };
+                hunk.lines.push(hl);
+                currentFile.lines.push(hl);
+                if (kind === '+') {
+                    currentFile.addedLines.add(physicalLine);
+                }
+                currentFile.lineToPosition.set(physicalLine, diffPosition);
+                if (kind !== '-')
+                    physicalLine++;
+                // 检测下一个 hunk header 或文件头或 EOF
+                // (在下一次循环时处理)
+            }
+            // 由于内层循环已经消费了 hunk 内容，需要调整 diffPosition
+            // 使得外层循环能正确继续
+            diffPosition--;
+            continue;
+        }
+        // 非文件头、非 hunk header 的行被跳过
+        // 更新 diffPosition tracking
+    }
+    console.log(`[parseDiff] ✅ 解析完成: ${files.size} 个代码文件需要审查`);
+    for (const [path, file] of files) {
+        console.log(`  - ${path}: ${file.hunks.length} hunks, ${file.addedLines.size} 行新增`);
+    }
+    return { files };
+}
+/**
+ * 将 LLM 输出的物理行号映射为 GitHub API 所需的 diff position。
+ *
+ * @param parsedDiff - diff 解析结果
+ * @param filePath   - 文件路径
+ * @param physicalLine - 物理行号（数字字符串）
+ * @returns diff position（1-based），找不到映射则返回 null
+ */
+function mapLineToPosition(parsedDiff, filePath, physicalLine) {
+    const file = parsedDiff.files.get(filePath);
+    if (!file)
+        return null;
+    return file.lineToPosition.get(physicalLine) ?? null;
+}
+/**
+ * 校验 LLM 输出的文件+行号是否在真实 diff 中存在。
+ *
+ * @returns 校验结果：
+ *   - 'valid'  → 文件存在且行号是实际新增/修改的行
+ *   - 'file_only' → 文件存在但行号不是新增行（可降级为 General Comment）
+ *   - 'invalid' → 文件不存在于 diff 中（应丢弃）
+ */
+function validateLocation(parsedDiff, filePath, line) {
+    const file = parsedDiff.files.get(filePath);
+    if (!file)
+        return 'invalid';
+    const lineNum = parseInt(line, 10);
+    if (isNaN(lineNum))
+        return 'file_only';
+    if (file.addedLines.has(lineNum))
+        return 'valid';
+    // 检查是否在 hunk 范围内（上下文行/删除行）
+    const inHunk = file.hunks.some((h) => {
+        return lineNum >= h.newStart && lineNum < h.newStart + h.newCount;
+    });
+    return inHunk ? 'file_only' : 'file_only';
+}
+
 ;// CONCATENATED MODULE: ./src/agent/reviewer.ts
 /**
  * src/agent/reviewer.ts
@@ -47842,53 +48152,35 @@ const _deployments_endpoints = new Set([
  *
  * 职责：
  * 1. 构建系统提示词（集成 RAG 注入 + JSON 防幻觉约束）
- * 2. 调用 DeepSeek V4（兼容 OpenAI SDK）执行智能代码审查
- * 3. 对 LLM 输出进行严格的 JSON schema 校验与清洗
+ * 2. 文件感知的 diff 截断与优先级排序
+ * 3. 调用 DeepSeek V4（兼容 OpenAI SDK）执行智能代码审查
+ * 4. 对 LLM 输出进行严格的 JSON schema 校验 + diff 行号真实性验证
  *
- * 核心设计：
- * - RAG（检索增强生成）: 将团队审查规则作为系统提示词扩展注入
- * - JSON 防幻觉策略: Prompt 约束 + 多层级解析 + 字段级校验 + 不合规过滤
+ * Phase 4 增强：
+ * - 文件感知截断：按代码文件优先，排除配置文件，Token 预算控制
+ * - 行号真实性校验：LLM 输出必须存在于 parsedDiff 中
  */
+
+
 
 // ---------------------------------------------------------------------------
 // 常量配置
 // ---------------------------------------------------------------------------
-/** DeepSeek API 端点（兼容 OpenAI SDK 的 baseURL 覆盖机制） */
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
-/** 默认使用 DeepSeek Chat 模型（V4 系列） */
 const DEFAULT_MODEL = 'deepseek-chat';
-/** Diff 内容的最大字符数，超出部分将被截断以控制 Token 消耗 */
-const MAX_DIFF_LENGTH = 50_000;
-/** API 调用最大重试次数（不含首次调用） */
-const MAX_RETRIES = 2;
+/** 最大 Token 预算（prompt 部分），DeepSeek V4 128K context，留 28K 给输出 */
+const MAX_PROMPT_TOKENS = 90_000;
+/** API 调用最大重试次数 */
+const reviewer_MAX_RETRIES = 2;
+/** 审查优先级：先审查源码文件 */
+const PRIORITY_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
-/**
- * 根据文本字符数粗略预估 Token 数量。
- *
- * 估算依据：
- * - 纯英文场景: 1 token ≈ 4 字符 → 系数 0.25
- * - 代码/中英混合场景: 1 token ≈ 2-3 字符 → 系数 0.3-0.5
- * - 这里取偏保守的 0.4，避免对中文/Unicode 场景过度乐观
- *
- * @param text - 待估算的文本
- * @returns 预估的 Token 数量（向上取整）
- */
 function estimateTokens(text) {
     return Math.ceil(text.length * 0.4);
 }
-/**
- * 判断 LLM 调用错误是否值得重试。
- *
- * 可重试的错误类型（瞬时故障）：
- * - 网络层: 超时、连接拒绝、连接重置、网络不可达
- * - 服务端: HTTP 5xx、429 速率限制
- *
- * @param error - 捕获的错误对象
- * @returns 如果可以重试返回 true
- */
-function isRetryableError(error) {
+function reviewer_isRetryableError(error) {
     const msg = error.message.toLowerCase();
     return (msg.includes('timeout') ||
         msg.includes('econnrefused') ||
@@ -47901,73 +48193,13 @@ function isRetryableError(error) {
         msg.includes('rate limit') ||
         msg.includes('internal server error'));
 }
-/** 异步等待指定毫秒数（用于失败重试的递增延迟） */
 function reviewer_sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 // ---------------------------------------------------------------------------
-// Prompt 构建 —— 系统提示词（核心：RAG 注入 + JSON 防幻觉约束）
+// Prompt 构建
 // ---------------------------------------------------------------------------
-/**
- * 构建发送给 LLM 的系统级提示词。
- *
- * ══════════════════════════════════════════════════════════════════════
- * 【RAG 注入过程详解】
- * ══════════════════════════════════════════════════════════════════════
- *
- * 本函数实现了轻量级 RAG（检索增强生成）的核心「增强」环节：
- *
- *   调用方流程:
- *     1. fetchTeamRules() 从目标仓库拉取 .github/REVIEW_RULES.md
- *     2. 将获取的规则文本传入本函数
- *     3. 本函数将规则作为「团队自定义规范」小节注入系统提示词
- *     4. LLM 同时参考通用最佳实践 + 团队规范生成审查意见
- *
- *   RAG 注入位置: 系统提示词末尾的独立小节
- *   RAG 格式: Markdown 原文直接嵌入（无需 chunk/embedding/向量检索）
- *
- * 这种方案的优势：
- *   - 零基础设施依赖（无需向量数据库或 embedding 服务）
- *   - 团队可以通过修改 REVIEW_RULES.md 实时调整审查偏好
- *   - 失败降级优雅（规则不存在时仍可使用通用规则审查）
- *
- * ══════════════════════════════════════════════════════════════════════
- * 【JSON 防幻觉策略详解】
- * ══════════════════════════════════════════════════════════════════════
- *
- * LLM 在生成结构化输出时容易出现以下「幻觉」问题：
- *   1. 输出 JSON 外还附带解释性文字（"以下是审查结果：[...]"）
- *   2. 用 Markdown 代码块包裹 JSON（```json ... ```）
- *   3. 杜撰不存在的文件路径
- *   4. 行号使用范围（"42-45"）或描述（"顶部附近"）
- *   5. comment 字段为模糊的赞美（"看起来不错"）
- *
- * 本 Prompt 中的对抗措施（分层防御）：
- *
- *   【第一层 - Prompt 约束】
- *   - 明确要求「仅返回 JSON 数组，不得包含任何其他文字」
- *   - 明确禁止 Markdown 代码块标记
- *   - 强制 file / line / comment 三个字段的语义约束
- *   - 要求 line 必须是纯数字字符串
- *
- *   【第二层 - 输出解析】（见 analyzeCode 函数）
- *   - 正则剥离可能的 Markdown 代码块包裹
- *   - JSON.parse 严格解析
- *   - 数组类型校验
- *
- *   【第三层 - 字段级校验】（见 analyzeCode 函数末尾）
- *   - 逐条检查 file 是否为非空 string
- *   - line 必须通过 /^\d+$/ 正则（纯数字）
- *   - comment 必须为非空 string
- *   - 不合规条目直接丢弃并记录告警日志
- *
- * ══════════════════════════════════════════════════════════════════════
- *
- * @param rules - 团队审查规则文本（从 fetchTeamRules 获取），可为 null
- * @returns 完整的系统提示词字符串
- */
 function buildSystemPrompt(rules) {
-    // ─── 第一部分: 通用审查规范（所有审查的基线标准）───
     const basePrompt = `你是一名资深 TypeScript / Node.js 代码审查专家，拥有十年以上的大型项目实战经验。
 
 你的任务是对 GitHub Pull Request 的 unified diff 进行深度审查，输出结构化的审查意见。
@@ -48016,10 +48248,6 @@ function buildSystemPrompt(rules) {
    - 触发条件的简要描述
    - 推荐的修复方案（优先给出代码片段）
 4. 如果经过仔细审查后认为代码质量良好、无实质性问题，返回空数组 []。`;
-    // ─── 第二部分: RAG 注入 —— 将团队规范追加到系统提示词末尾 ───
-    // 这是轻量级 RAG 的核心步骤：
-    // 从外部知识源（.github/REVIEW_RULES.md）检索到的规则作为上下文扩展
-    // 注入到 Prompt 中，让模型在审查时同时遵守通用规范和团队约定。
     if (rules) {
         const ragSection = [
             '',
@@ -48039,31 +48267,86 @@ function buildSystemPrompt(rules) {
     return basePrompt;
 }
 /**
- * 构建用户级提示词 —— 携带待审查的 diff 内容。
+ * 构建文件感知的用户提示词。
  *
- * 如果 diff 超过预设最大长度（MAX_DIFF_LENGTH），对内容进行截断处理：
- * - 保留前半部分（通常包含最重要的核心变更）
- * - 追加截断提示，引导模型优先关注前半部分
+ * 从 parsedDiff 提取代码文件，按优先级排列，在 Token 预算内构造 Prompt。
  *
- * @param diff - PR 的 unified diff 文本
+ * @param rawDiff    - 原始 unified diff 文本
+ * @param parsedDiff - diff 解析结果
  * @returns 用户提示词字符串
  */
-function buildUserPrompt(diff) {
-    const truncated = diff.length > MAX_DIFF_LENGTH;
-    if (truncated) {
-        console.warn(`[buildUserPrompt] ⚠️  diff 长度 (${diff.length} 字符) 超过 ${MAX_DIFF_LENGTH} 限制，将被截断处理`);
+function buildUserPrompt(rawDiff, parsedDiff) {
+    const fileSections = splitDiffByFile(rawDiff);
+    // 分离优先级文件和普通文件
+    const priority = [];
+    const normal = [];
+    for (const [path, content] of fileSections) {
+        if (!parsedDiff.files.has(path))
+            continue; // 跳过被过滤的文件
+        const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
+        if (PRIORITY_EXTENSIONS.includes(ext)) {
+            priority.push(content);
+        }
+        else {
+            normal.push(content);
+        }
     }
-    const diffContent = truncated
-        ? diff.slice(0, MAX_DIFF_LENGTH) +
-            '\n\n[... diff 已被截断，请优先审查前半部分的逻辑变更和安全问题 ...]'
-        : diff;
-    return [
-        '以下是本次 Pull Request 的代码变更（unified diff 格式）：',
-        '',
-        diffContent,
-        '',
-        '请严格按照系统提示词中的 JSON 数组格式返回你的审查结果。',
-    ].join('\n');
+    const orderedSections = [...priority, ...normal];
+    const totalFiles = orderedSections.length;
+    if (totalFiles === 0) {
+        console.warn('[buildUserPrompt] ⚠️  无代码文件需要审查');
+        return '本次 PR 仅包含配置文件变更，无可审查的源代码文件。';
+    }
+    // Token 预算控制：从头累积文件，超出则截断
+    const prefix = `以下是本次 PR 的代码变更（共 ${parsedDiff.files.size} 个代码文件，此处展示 ${totalFiles} 个）：\n\n`;
+    let body = prefix;
+    let budget = MAX_PROMPT_TOKENS - estimateTokens(prefix);
+    let included = 0;
+    let truncated = false;
+    for (const section of orderedSections) {
+        const sectionTokens = estimateTokens(section);
+        if (budget - sectionTokens < 0) {
+            truncated = true;
+            break;
+        }
+        body += section;
+        budget -= sectionTokens;
+        included++;
+    }
+    if (truncated && included < totalFiles) {
+        body += `\n\n[... Token 预算限制，省略 ${totalFiles - included} 个文件。以上 ${included} 个文件为按优先级排列的源码文件 ...]\n`;
+    }
+    console.log(`[buildUserPrompt] 📊 文件感知 Prompt: ${included}/${totalFiles} 个文件，预估 ~${estimateTokens(body)} tokens`);
+    return body + '\n请严格按照系统提示词中的 JSON 数组格式返回你的审查结果。';
+}
+/**
+ * 将 raw diff 按文件切分为 (filePath, fileSection) 对。
+ */
+function splitDiffByFile(rawDiff) {
+    const sections = new Map();
+    const lines = rawDiff.split('\n');
+    let currentPath = null;
+    let currentLines = [];
+    for (const line of lines) {
+        // 检测文件头：diff --git a/... b/...
+        const fileMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+        if (fileMatch) {
+            if (currentPath && currentLines.length > 0) {
+                sections.set(currentPath, currentLines.join('\n'));
+            }
+            currentPath = fileMatch[2];
+            currentLines = [line];
+            continue;
+        }
+        if (currentPath) {
+            currentLines.push(line);
+        }
+    }
+    // 最后一个文件
+    if (currentPath && currentLines.length > 0) {
+        sections.set(currentPath, currentLines.join('\n'));
+    }
+    return sections;
 }
 // ---------------------------------------------------------------------------
 // JSON 清洗与校验 —— 防幻觉的第二 & 第三道防线
@@ -48071,42 +48354,22 @@ function buildUserPrompt(diff) {
 /**
  * 对 LLM 返回的原始文本进行清洗、解析和字段级校验。
  *
- * ── 分层防御流程 ──
- *
- *   原始文本 (LLM 返回)
- *     │
- *     ▼
- *   【第二层】清洗 & JSON 解析
- *     ├── 剥离可能的 Markdown 代码块标记（```json ... ```）
- *     ├── 尝试 JSON.parse
- *     ├── 若失败 → 正则提取 JSON 数组片段再试
- *     └── 仍然失败 → 抛出异常
- *     │
- *     ▼
- *   【第三层】字段级逐条校验
- *     ├── 必须是数组
- *     ├── 每项必须是 object
- *     ├── file: 非空 string
- *     ├── line: string 且通过 /^\d+$/ 正则
- *     ├── comment: 非空 string
- *     └── 不合规条目 → 丢弃 + console.warn
- *     │
- *     ▼
- *   返回干净的 ReviewComment[]
+ * Phase 4 新增：对验证通过的条目，通过 parsedDiff 验证 file + line 的真实性。
+ * - 'valid' → 保留并附带 diff position（用于 inline comment）
+ * - 'file_only' → 保留但 position=null（降级为 review body 通用评论）
+ * - 'invalid' → 丢弃
  *
  * @param rawContent - LLM 的原始响应文本
- * @returns 通过全部校验的审查意见数组
- * @throws 当无法从响应中提取有效 JSON 数组时
+ * @param parsedDiff - diff 解析结果，用于行号真实性校验
+ * @returns 通过校验的审查意见数组
  */
-function parseAndValidateResponse(rawContent) {
+function parseAndValidateResponse(rawContent, parsedDiff) {
     let jsonStr = rawContent;
     // ─── 第二层 Step 1: 剥离 Markdown 代码块标记 ───
-    // 即使 Prompt 明确禁止使用 ```json```，部分模型仍可能添加。
-    // 使用正则提取代码块内的内容，作为第一道清洗。
     const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (codeBlockMatch) {
         jsonStr = codeBlockMatch[1].trim();
-        console.log('[parseAndValidateResponse] 检测到 Markdown 代码块包裹，已自动剥离（模型未完全遵守格式约束）');
+        console.log('[parseAndValidateResponse] 检测到 Markdown 代码块包裹，已自动剥离');
     }
     // ─── 第二层 Step 2: JSON.parse ───
     let parsed;
@@ -48114,7 +48377,6 @@ function parseAndValidateResponse(rawContent) {
         parsed = JSON.parse(jsonStr);
     }
     catch (firstError) {
-        // 直接解析失败时，尝试从文本中提取 JSON 数组片段（容错处理）
         console.warn(`[parseAndValidateResponse] 首次 JSON.parse 失败: ${firstError instanceof Error ? firstError.message : String(firstError)}`);
         console.warn('[parseAndValidateResponse] 尝试从输出中正则提取 JSON 数组片段...');
         const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
@@ -48130,18 +48392,17 @@ function parseAndValidateResponse(rawContent) {
                 `数组片段前 200 字符: ${arrayMatch[0].slice(0, 200)}`);
         }
     }
-    // ─── 第二层 Step 3: 根类型校验（必须是数组）───
+    // ─── 第二层 Step 3: 根类型校验 ───
     if (!Array.isArray(parsed)) {
-        throw new Error(`LLM 返回的 JSON 根类型不是数组，而是 "${typeof parsed}"。` +
-            `这是明显的幻觉输出，缺乏有效的结构化数据。` +
-            `原始内容: ${rawContent.slice(0, 300)}`);
+        throw new Error(`LLM 返回的 JSON 根类型不是数组。原始内容: ${rawContent.slice(0, 300)}`);
     }
-    // ─── 第三层: 逐条字段级校验与过滤 ───
+    // ─── 第三层: 逐条字段级校验 + diff 行号真实性验证 ───
     const validComments = [];
     const skippedItems = [];
+    let discardedCount = 0;
+    let generalCount = 0;
     for (let i = 0; i < parsed.length; i++) {
         const item = parsed[i];
-        // 基础类型检查：必须是非 null 对象，排除数组、基本类型
         if (!item || typeof item !== 'object' || Array.isArray(item)) {
             skippedItems.push(`[${i}] 类型异常: ${JSON.stringify(item)}`);
             continue;
@@ -48150,21 +48411,10 @@ function parseAndValidateResponse(rawContent) {
         const file = record.file;
         const line = record.line;
         const comment = record.comment;
-        // ── 字段级严格校验 ──
-        // 每个字段都必须存在、类型正确、内容非空
         const fileValid = typeof file === 'string' && file.trim().length > 0;
-        const lineValid = typeof line === 'string' &&
-            /^\d+$/.test(line); // 正则: 仅纯阿拉伯数字
+        const lineValid = typeof line === 'string' && /^\d+$/.test(line);
         const commentValid = typeof comment === 'string' && comment.trim().length > 0;
-        if (fileValid && lineValid && commentValid) {
-            validComments.push({
-                file: file.trim(),
-                line, // 保留原始数字字符串，不做类型转换
-                comment: comment.trim(),
-            });
-        }
-        else {
-            // 记录具体哪一项不满足要求，方便排查模型行为
+        if (!fileValid || !lineValid || !commentValid) {
             const failures = [];
             if (!fileValid)
                 failures.push(`file 无效: ${JSON.stringify(file)}`);
@@ -48173,80 +48423,51 @@ function parseAndValidateResponse(rawContent) {
             if (!commentValid)
                 failures.push(`comment 无效: ${JSON.stringify(comment)}`);
             skippedItems.push(`[${i}] ${failures.join('; ')}`);
+            continue;
+        }
+        const cleanFile = file.trim();
+        const cleanLine = line;
+        const cleanComment = comment.trim();
+        // ── Phase 4: diff 行号真实性校验 ──
+        const locationStatus = validateLocation(parsedDiff, cleanFile, cleanLine);
+        if (locationStatus === 'invalid') {
+            // 文件不存在于 diff 中 → 丢弃
+            skippedItems.push(`[${i}] 文件不存在于 diff: ${cleanFile} (LLM 幻觉)`);
+            discardedCount++;
+            continue;
+        }
+        const position = mapLineToPosition(parsedDiff, cleanFile, parseInt(cleanLine, 10));
+        if (locationStatus === 'file_only') {
+            // 文件存在但行号不是新增行 → 降级为通用评论
+            validComments.push({
+                file: cleanFile,
+                line: cleanLine,
+                comment: cleanComment,
+                // position 为 null/undefined，github.ts 会将其作为 body 评论
+            });
+            generalCount++;
+        }
+        else {
+            // 有效行号 → inline comment
+            validComments.push({
+                file: cleanFile,
+                line: cleanLine,
+                comment: cleanComment,
+                position: position ?? undefined,
+            });
         }
     }
-    // 输出字段级过滤的统计信息
     if (skippedItems.length > 0) {
-        console.warn(`[parseAndValidateResponse] ⚠️  从 ${parsed.length} 条原始输出中过滤掉 ${skippedItems.length} 条不合规条目:`);
+        console.warn(`[parseAndValidateResponse] ⚠️  过滤 ${skippedItems.length} 条: ${discardedCount} 丢弃 + ${generalCount} 降级为通用`);
         skippedItems.forEach((s) => console.warn(`  - ${s}`));
     }
-    console.log(`[parseAndValidateResponse] 🎯 JSON 防幻觉校验完成: ${parsed.length} 条输入 → ${validComments.length} 条通过`);
+    console.log(`[parseAndValidateResponse] 🎯 校验完成: ${parsed.length} 条输入 → ${validComments.length} 条通过 (${validComments.filter((c) => c.position).length} inline + ${generalCount} general)`);
     return validComments;
 }
 // ---------------------------------------------------------------------------
 // 核心导出函数: analyzeCode
 // ---------------------------------------------------------------------------
-/**
- * 使用大模型对 PR diff 进行智能代码审查。
- *
- * ══════════════════════════════════════════════════════════════════════
- * 完整调用流程（含 RAG 注入和 JSON 防幻觉的全链路）
- * ══════════════════════════════════════════════════════════════════════
- *
- *   输入:
- *     diff ───────────────┐
- *     teamRules ──────────┤
- *     apiKey ─────────────┤
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 1. 参数校验 / Token 预估 / 日志输出     │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 2. buildSystemPrompt(teamRules)        │
- *     │    ├── 通用审查规范                     │
- *     │    └── RAG 注入: 团队规范 → 系统提示词  │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 3. buildUserPrompt(diff)               │
- *     │    └── diff 内容 → 用户提示词           │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 4. OpenAI SDK → DeepSeek V4 API       │
- *     │    ├── temperature=0.1 (低温度抗幻觉)   │
- *     │    ├── max_tokens=4096                 │
- *     │    └── 失败自动重试 (最多 2 次)         │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 5. parseAndValidateResponse()          │
- *     │    ├── 第二层: 清洗 + JSON.parse       │
- *     │    └── 第三层: 逐条字段校验 & 过滤      │
- *     └────────────────────────────────────────┘
- *                          │
- *                          ▼
- *     ┌────────────────────────────────────────┐
- *     │ 6. 返回 AnalysisResult { comments,     │
- *     │                         usage }         │
- *     └────────────────────────────────────────┘
- *
- * ══════════════════════════════════════════════════════════════════════
- *
- * @param diff      - 从 fetchPRDiff() 获取的 PR unified diff 文本
- * @param teamRules - 从 fetchTeamRules() 获取的团队审查规则（可为 null）
- * @param apiKey    - DeepSeek API Key（通过环境变量传入，不硬编码）
- * @param model     - 可选模型名，默认 "deepseek-chat"（DeepSeek V4）
- * @returns 结构化审查结果，包含通过校验的审查意见列表和 Token 用量
- * @throws 当 LLM 调用经全部重试后仍失败时
- */
-async function analyzeCode(diff, teamRules, apiKey, model = DEFAULT_MODEL, baseUrl = DEEPSEEK_BASE_URL) {
-    // ─── 1. 前置校验 ───
+async function analyzeCode(diff, teamRules, apiKey, parsedDiff, model = DEFAULT_MODEL, baseUrl = DEEPSEEK_BASE_URL) {
     if (!diff || diff.trim().length === 0) {
         console.warn('[analyzeCode] diff 为空，跳过 LLM 审查调用');
         return { comments: [] };
@@ -48254,44 +48475,45 @@ async function analyzeCode(diff, teamRules, apiKey, model = DEFAULT_MODEL, baseU
     if (!apiKey || apiKey.trim().length === 0) {
         throw new Error('[analyzeCode] API Key 未提供或为空，无法调用 DeepSeek API。请检查环境变量配置。');
     }
-    // ─── 2. 构建 Prompt（含 RAG 注入）───
+    if (parsedDiff.files.size === 0) {
+        console.log('[analyzeCode] 无代码文件需要审查（仅包含配置文件变更）');
+        return { comments: [] };
+    }
     const systemPrompt = buildSystemPrompt(teamRules);
-    const userPrompt = buildUserPrompt(diff);
-    // ─── 3. Token 消耗预估 ───
+    const userPrompt = buildUserPrompt(diff, parsedDiff);
     const estimatedSystem = estimateTokens(systemPrompt);
     const estimatedUser = estimateTokens(userPrompt);
-    const estimatedTotal = estimatedSystem + estimatedUser;
-    console.log(`[analyzeCode] 📊 Token 消耗预估:`);
-    console.log(`  - 系统提示词: ~${estimatedSystem} tokens (${systemPrompt.length} 字符)`);
-    console.log(`  - 用户提示词: ~${estimatedUser} tokens (${userPrompt.length} 字符)`);
-    console.log(`  - 预估合计:   ~${estimatedTotal} tokens`);
-    // ─── 4. 初始化 OpenAI 客户端（指向 DeepSeek API）───
-    // DeepSeek 的 API 与 OpenAI SDK 完全兼容，只需修改 baseURL 即可。
-    const client = new OpenAI({
-        apiKey,
-        baseURL: baseUrl,
-    });
-    // ─── 5. 构建消息 ───
+    console.log('[analyzeCode] 📊 Token 消耗预估:');
+    console.log(`  - 系统提示词: ~${estimatedSystem} tokens`);
+    console.log(`  - 用户提示词: ~${estimatedUser} tokens`);
+    console.log(`  - 预估合计:   ~${estimatedSystem + estimatedUser} tokens`);
+    const client = new OpenAI({ apiKey, baseURL: baseUrl });
     const messages = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
     ];
-    // ─── 6. 调用 LLM（带重试逻辑）───
     let lastError = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= reviewer_MAX_RETRIES; attempt++) {
         try {
-            console.log(`[analyzeCode] 🚀 正在调用 ${model} API（第 ${attempt + 1}/${MAX_RETRIES + 1} 次尝试）...`);
+            console.log(`[analyzeCode] 🚀 正在调用 ${model} API（第 ${attempt + 1}/${reviewer_MAX_RETRIES + 1} 次尝试）...`);
             const completion = await client.chat.completions.create({
                 model,
                 messages,
-                temperature: 0.1, // 低温度: 提高输出确定性，减少随机幻觉
+                temperature: 0.1,
                 max_tokens: 4096,
             });
             const rawContent = completion.choices[0]?.message?.content?.trim() ?? '';
             console.log(`[analyzeCode] ✅ LLM 响应成功，原始输出长度: ${rawContent.length} 字符`);
             console.log(`[analyzeCode] 实际 Token 用量 — prompt: ${completion.usage?.prompt_tokens ?? 'N/A'}, completion: ${completion.usage?.completion_tokens ?? 'N/A'}, total: ${completion.usage?.total_tokens ?? 'N/A'}`);
-            // ─── 7. JSON 防幻觉校验（第二层 + 第三层防线）───
-            const validComments = parseAndValidateResponse(rawContent);
+            if (completion.usage) {
+                logTokenUsage({
+                    model,
+                    promptTokens: completion.usage.prompt_tokens,
+                    completionTokens: completion.usage.completion_tokens,
+                    totalTokens: completion.usage.total_tokens,
+                });
+            }
+            const validComments = parseAndValidateResponse(rawContent, parsedDiff);
             return {
                 comments: validComments,
                 usage: completion.usage
@@ -48304,22 +48526,18 @@ async function analyzeCode(diff, teamRules, apiKey, model = DEFAULT_MODEL, baseU
             };
         }
         catch (error) {
-            lastError =
-                error instanceof Error ? error : new Error(String(error));
+            lastError = error instanceof Error ? error : new Error(String(error));
             console.error(`[analyzeCode] ❌ 第 ${attempt + 1} 次 API 调用失败: ${lastError.message}`);
-            // 判断是否需要重试
-            if (attempt < MAX_RETRIES && isRetryableError(lastError)) {
-                const waitMs = (attempt + 1) * 1000; // 递增延迟: 1s, 2s
+            if (attempt < reviewer_MAX_RETRIES && reviewer_isRetryableError(lastError)) {
+                const waitMs = (attempt + 1) * 1000;
                 console.log(`[analyzeCode] ⏳ 检测到可重试错误，${waitMs}ms 后进行第 ${attempt + 2} 次尝试...`);
                 await reviewer_sleep(waitMs);
                 continue;
             }
-            // 不可重试的错误直接跳出
             break;
         }
     }
-    // ─── 8. 所有重试均失败 ───
-    throw new Error(`[analyzeCode] LLM 调用在 ${MAX_RETRIES + 1} 次尝试后仍然失败。` +
+    throw new Error(`[analyzeCode] LLM 调用在 ${reviewer_MAX_RETRIES + 1} 次尝试后仍然失败。` +
         `最后错误: ${lastError?.message ?? '未知错误'}`);
 }
 
@@ -48330,10 +48548,14 @@ async function analyzeCode(diff, teamRules, apiKey, model = DEFAULT_MODEL, baseU
  *
  * 职责：
  * 作为 GitHub Action 的绝对起点，串联整个审查流水线：
- *   输入参数 → 获取 PR diff → 加载 RAG 规则 → AI 审查 → 发布评论
+ *   输入参数 → 获取 PR diff → 解析 diff → 加载 RAG 规则 → AI 审查 → 发布行级 Review
  *
- * 这是 Phase 3 的核心交付物，将 Phase 1-2 的各模块打通为完整闭环。
+ * Phase 4 增强：
+ * - 引入 diff-parser 实现文件感知截断 + 行号校验
+ * - 使用 createPRReview 替代通用评论，支持行级 inline comment
  */
+
+
 
 
 
@@ -48348,19 +48570,34 @@ async function run() {
         const octokit = getOctokit(githubToken);
         const { owner, repo } = github_context.repo;
         const prNumber = github_context.issue.number;
-        console.log(`[index] 🚀 开始审查 PR #${prNumber} (${owner}/${repo})`);
+        const commitId = github_context.sha; // PR head commit SHA
+        console.log(`[index] 🚀 开始审查 PR #${prNumber} (${owner}/${repo}) @ ${commitId.slice(0, 7)}`);
         // ─── 3. 获取 PR 的 unified diff ───
         const diff = await fetchPRDiff(octokit, owner, repo, prNumber);
+        // ─── 3.5 解析 diff（文件感知 + 行号映射）───
+        const parsedDiff = parseDiff(diff);
+        if (parsedDiff.files.size === 0) {
+            console.log('[index] ℹ️  PR 仅包含配置文件变更，无需审查');
+            return;
+        }
         // ─── 4. 加载团队自定义审查规则（轻量级 RAG）───
         const teamRules = await fetchTeamRules(octokit, owner, repo);
         // ─── 5. 调用 AI 引擎执行深度审查 ───
-        const result = await analyzeCode(diff, teamRules, openaiKey, undefined, openaiBaseUrl);
+        const result = await analyzeCode(diff, teamRules, openaiKey, parsedDiff, undefined, openaiBaseUrl);
         console.log(`[index] 📋 审查完成，共发现 ${result.comments.length} 条意见`);
         if (result.usage) {
             console.log(`[index] 💰 Token 用量 — prompt: ${result.usage.promptTokens}, completion: ${result.usage.completionTokens}, total: ${result.usage.totalTokens}`);
+            logTokenUsage({
+                model: 'deepseek-chat',
+                promptTokens: result.usage.promptTokens,
+                completionTokens: result.usage.completionTokens,
+                totalTokens: result.usage.totalTokens,
+                prNumber,
+                repo: `${owner}/${repo}`,
+            });
         }
-        // ─── 6. 将审查结果发布为 PR 评论（闭环的最后一步）───
-        await createReviewComment(octokit, owner, repo, prNumber, result.comments);
+        // ─── 6. 将审查结果发布为行级 PR Review（闭环的最后一步）───
+        await createPRReview(octokit, owner, repo, prNumber, result.comments, commitId);
         console.log('[index] ✅ 审查流水线全部完成');
     }
     catch (error) {
